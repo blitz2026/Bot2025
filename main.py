@@ -4,8 +4,7 @@ VK SUGGEST AUTOPOSTER — OAuth версия
 =========================================================
 
 Что делает:
-  - Раз в сутки (по расписанию POST_TIMES) берёт 1 запись из
-    предложки сообщества через wall.get filter=suggests
+  - Берёт записи из предложки сообщества через wall.get
   - wall.get выполняется пользовательским VK OAuth токеном
   - Публикация выполняется токеном сообщества
   - Отправляет скрин в Groq Vision
@@ -13,47 +12,19 @@ VK SUGGEST AUTOPOSTER — OAuth версия
   - Удаляет запись из предложки
   - Отвечает на комментарии через Callback API
 
-=========================================================
-ENV
-=========================================================
-
-Обязательные:
+ENV:
 
 VK_TOKEN
-    Токен сообщества.
-
 VK_GROUP_ID
-    ID сообщества без минуса.
-
 GROQ_API_KEY
-    Ключ Groq.
-
 VK_CONFIRMATION_CODE
-    Код подтверждения Callback API.
-
 VK_GROUP_SECRET
-    Секрет Callback API.
 
-Для OAuth:
+OAuth:
 
 VK_CLIENT_ID
-    ID приложения VK.
-
 VK_CLIENT_SECRET
-    Защищённый ключ приложения VK.
-
 VK_REDIRECT_URI
-    Например:
-    https://твой-сервис.onrender.com/vk/oauth/callback
-
-После запуска открыть:
-
-https://твой-сервис.onrender.com/vk/login
-
-После авторизации VK перенаправит обратно на сервер,
-сервер сам обменяет code на пользовательский access_token.
-
-=========================================================
 """
 
 import os
@@ -69,58 +40,33 @@ from flask import Flask, request, redirect
 from groq import Groq
 
 
-# =========================================================
-# CONFIG
-# =========================================================
-
 VK_API = "https://api.vk.com/method"
 VK_VERSION = "5.199"
 
-# ---------------------------------------------------------
-# Токен сообщества
-# ---------------------------------------------------------
-
 VK_TOKEN = os.environ.get("VK_TOKEN", "").strip()
-
-# ---------------------------------------------------------
-# VK OAuth
-# ---------------------------------------------------------
 
 VK_CLIENT_ID = os.environ.get("VK_CLIENT_ID", "").strip()
 VK_CLIENT_SECRET = os.environ.get("VK_CLIENT_SECRET", "").strip()
 VK_REDIRECT_URI = os.environ.get("VK_REDIRECT_URI", "").strip()
 
-# Пользовательский токен.
-#
-# Если он уже есть в Render Environment Variables,
-# бот сможет использовать его сразу.
-#
-# После OAuth токен также записывается в память процесса.
 VK_USER_TOKEN = os.environ.get("VK_USER_TOKEN", "").strip()
-
-# Защита OAuth state
-oauth_state = None
-oauth_state_lock = threading.Lock()
-
-# ---------------------------------------------------------
-# Сообщество
-# ---------------------------------------------------------
 
 GROUP_ID = int(os.environ.get("VK_GROUP_ID", "0") or 0)
 
 VK_CONFIRMATION_CODE = os.environ.get(
-    "VK_CONFIRMATION_CODE", ""
+    "VK_CONFIRMATION_CODE",
+    ""
 ).strip()
 
 VK_GROUP_SECRET = os.environ.get(
-    "VK_GROUP_SECRET", ""
+    "VK_GROUP_SECRET",
+    ""
 ).strip()
 
-# ---------------------------------------------------------
-# Groq
-# ---------------------------------------------------------
-
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
+GROQ_API_KEY = os.environ.get(
+    "GROQ_API_KEY",
+    ""
+).strip()
 
 GROQ_VISION_MODEL = os.environ.get(
     "GROQ_VISION_MODEL",
@@ -132,15 +78,7 @@ GROQ_TEXT_MODEL = os.environ.get(
     "llama-3.3-70b-versatile",
 )
 
-# ---------------------------------------------------------
-# Расписание
-# ---------------------------------------------------------
-
 POST_TIMES = ["12:00", "20:00"]
-
-# ---------------------------------------------------------
-# Тестовый режим
-# ---------------------------------------------------------
 
 TEST_MODE = (
     os.environ.get("TEST_MODE", "0").strip() == "1"
@@ -149,14 +87,9 @@ TEST_MODE = (
 TEST_INTERVAL_MINUTES = int(
     os.environ.get(
         "TEST_INTERVAL_MINUTES",
-        "10",
-    )
-    or 10
+        "10"
+    ) or 10
 )
-
-# ---------------------------------------------------------
-# Groq client
-# ---------------------------------------------------------
 
 groq_client = (
     Groq(api_key=GROQ_API_KEY)
@@ -164,30 +97,14 @@ groq_client = (
     else None
 )
 
-# ---------------------------------------------------------
-# Callback protection
-# ---------------------------------------------------------
+oauth_state = None
+oauth_state_lock = threading.Lock()
 
 processed_events = set()
 processed_events_lock = threading.Lock()
 
 
-# =========================================================
-# VK HELPERS
-# =========================================================
-
 def vk_call(method, token=None, **params):
-    """
-    Универсальный вызов VK API.
-
-    По умолчанию используется токен сообщества.
-
-    Для методов, которым нужен пользовательский токен,
-    можно передать:
-
-        token=VK_USER_TOKEN
-    """
-
     access_token = token or VK_TOKEN
 
     if not access_token:
@@ -198,15 +115,15 @@ def vk_call(method, token=None, **params):
     params["access_token"] = access_token
     params["v"] = VK_VERSION
 
-    r = requests.post(
+    response = requests.post(
         f"{VK_API}/{method}",
         data=params,
         timeout=20,
     )
 
-    r.raise_for_status()
+    response.raise_for_status()
 
-    data = r.json()
+    data = response.json()
 
     if "error" in data:
         raise RuntimeError(data["error"])
@@ -214,26 +131,14 @@ def vk_call(method, token=None, **params):
     return data["response"]
 
 
-# =========================================================
-# VK SUGGESTS
-# =========================================================
-
 def get_suggested_posts(count=1, offset=0):
-    """
-    Получение предложки.
-
-    ВАЖНО:
-    wall.get filter=suggests выполняем пользовательским
-    OAuth токеном.
-    """
-
     if not VK_USER_TOKEN:
         raise RuntimeError(
             "VK_USER_TOKEN отсутствует. "
             "Открой /vk/login и пройди авторизацию VK."
         )
 
-    resp = vk_call(
+    response = vk_call(
         "wall.get",
         token=VK_USER_TOKEN,
         owner_id=-GROUP_ID,
@@ -242,12 +147,8 @@ def get_suggested_posts(count=1, offset=0):
         offset=offset,
     )
 
-    return resp.get("items", [])
+    return response.get("items", [])
 
-
-# =========================================================
-# PHOTOS
-# =========================================================
 
 def get_biggest_photo_url(photo):
     sizes = photo.get("sizes", [])
@@ -257,38 +158,30 @@ def get_biggest_photo_url(photo):
 
     biggest = max(
         sizes,
-        key=lambda s:
-        s.get("width", 0) * s.get("height", 0)
+        key=lambda item:
+        item.get("width", 0) *
+        item.get("height", 0)
     )
 
     return biggest.get("url")
 
 
-# =========================================================
-# USER MENTION
-# =========================================================
-
 def get_user_mention(user_id):
-    """
-    VK-упоминание автора предложки:
-    [id123|Имя Фамилия]
-    """
-
     if not user_id or user_id <= 0:
         return "аноним"
 
     try:
-        resp = vk_call(
+        response = vk_call(
             "users.get",
             user_ids=user_id,
         )
 
-        if resp:
-            u = resp[0]
+        if response:
+            user = response[0]
 
             name = (
-                f"{u.get('first_name', '')} "
-                f"{u.get('last_name', '')}"
+                f"{user.get('first_name', '')} "
+                f"{user.get('last_name', '')}"
             ).strip()
 
             return f"[id{user_id}|{name}]"
@@ -303,17 +196,7 @@ def get_user_mention(user_id):
     return f"[id{user_id}|автор]"
 
 
-# =========================================================
-# DELETE SUGGEST
-# =========================================================
-
 def _safe_delete(post_id):
-    """
-    Удаление записи из предложки.
-
-    Здесь используется токен сообщества.
-    """
-
     try:
         vk_call(
             "wall.delete",
@@ -328,10 +211,6 @@ def _safe_delete(post_id):
             flush=True,
         )
 
-
-# =========================================================
-# AI — SCREENSHOT
-# =========================================================
 
 PROMPT = (
     "Это скриншот из мобильной игры World of Tanks Blitz, "
@@ -360,7 +239,10 @@ def analyze_screenshot(photo_url):
 
     try:
         completion = (
-            groq_client.chat.completions.create(
+            groq_client
+            .chat
+            .completions
+            .create(
                 model=GROQ_VISION_MODEL,
                 messages=[
                     {
@@ -410,7 +292,7 @@ def analyze_screenshot(photo_url):
             "is_relevant": bool(
                 parsed.get(
                     "is_relevant",
-                    True,
+                    True
                 )
             ),
             "text": text,
@@ -426,22 +308,13 @@ def analyze_screenshot(photo_url):
         return fallback
 
 
-# =========================================================
-# PUBLISH ONE SUGGESTED POST
-# =========================================================
-
 def publish_next_suggested():
-
     if not VK_TOKEN or not GROUP_ID:
         print(
             "VK_TOKEN / VK_GROUP_ID не заданы.",
             flush=True,
         )
         return
-
-    # -----------------------------------------------------
-    # Проверяем пользовательский токен
-    # -----------------------------------------------------
 
     if not VK_USER_TOKEN:
         print(
@@ -456,63 +329,48 @@ def publish_next_suggested():
 
         return
 
-    # -----------------------------------------------------
-    # Получаем предложку
-    # -----------------------------------------------------
-
     try:
-
-        items = get_suggested_posts(
-            count=1
-        )
+        items = get_suggested_posts(count=1)
 
     except Exception as e:
-
         print(
             "get_suggested_posts error:",
             e,
             flush=True,
         )
-
         return
 
     if not items:
-
         print(
             "Предложка пуста.",
             flush=True,
         )
-
         return
 
     post = items[0]
 
     post_id = post["id"]
-    author_id = post.get("from_id")
 
-    # -----------------------------------------------------
-    # Ищем фото
-    # -----------------------------------------------------
+    author_id = post.get("from_id")
 
     photo = next(
         (
-            a["photo"]
-            for a in post.get(
+            attachment["photo"]
+            for attachment in post.get(
                 "attachments",
                 []
             )
-            if a.get("type") == "photo"
+            if attachment.get("type") == "photo"
         ),
         None,
     )
 
     if not photo:
-
         _safe_delete(post_id)
 
         print(
             f"Пост {post_id} без фото — "
-            f"убран из очереди.",
+            "убран из очереди.",
             flush=True,
         )
 
@@ -520,34 +378,23 @@ def publish_next_suggested():
 
     photo_url = get_biggest_photo_url(photo)
 
-    # -----------------------------------------------------
-    # AI
-    # -----------------------------------------------------
-
     ai_result = analyze_screenshot(
         photo_url
     )
 
     if not ai_result["is_relevant"]:
-
         _safe_delete(post_id)
 
         print(
             f"Пост {post_id} отклонён AI "
-            f"как нерелевантный.",
+            "как нерелевантный.",
             flush=True,
         )
 
         return
 
-    # -----------------------------------------------------
-    # Формируем публикацию
-    # -----------------------------------------------------
-
     attachment_str = (
-        f"photo"
-        f"{photo['owner_id']}_"
-        f"{photo['id']}"
+        f"photo{photo['owner_id']}_{photo['id']}"
     )
 
     mention = get_user_mention(
@@ -559,12 +406,7 @@ def publish_next_suggested():
         f"Прислал: {mention}"
     )
 
-    # -----------------------------------------------------
-    # Публикуем от имени сообщества
-    # -----------------------------------------------------
-
     try:
-
         vk_call(
             "wall.post",
             owner_id=-GROUP_ID,
@@ -572,9 +414,6 @@ def publish_next_suggested():
             message=message,
             attachments=attachment_str,
         )
-
-        # После успешной публикации удаляем
-        # исходную запись из предложки.
 
         _safe_delete(post_id)
 
@@ -585,17 +424,12 @@ def publish_next_suggested():
         )
 
     except Exception as e:
-
         print(
             "wall.post error:",
             e,
             flush=True,
         )
 
-
-# =========================================================
-# AI — COMMENTS
-# =========================================================
 
 COMMENT_SYSTEM_PROMPT = (
     "Ты — живой участник геймерского паблика ВКонтакте "
@@ -612,25 +446,24 @@ COMMENT_SYSTEM_PROMPT = (
 
 
 def generate_comment_reply(comment_text):
-
     if not groq_client or not comment_text:
         return ""
 
     try:
-
         completion = (
-            groq_client.chat.completions.create(
+            groq_client
+            .chat
+            .completions
+            .create(
                 model=GROQ_TEXT_MODEL,
                 messages=[
                     {
                         "role": "system",
-                        "content":
-                            COMMENT_SYSTEM_PROMPT,
+                        "content": COMMENT_SYSTEM_PROMPT,
                     },
                     {
                         "role": "user",
-                        "content":
-                            comment_text,
+                        "content": comment_text,
                     },
                 ],
                 max_tokens=120,
@@ -638,7 +471,7 @@ def generate_comment_reply(comment_text):
             )
         )
 
-        reply = (
+        return (
             completion
             .choices[0]
             .message
@@ -646,10 +479,7 @@ def generate_comment_reply(comment_text):
             .strip()
         )
 
-        return reply
-
     except Exception as e:
-
         print(
             "generate_comment_reply error:",
             e,
@@ -660,7 +490,6 @@ def generate_comment_reply(comment_text):
 
 
 def handle_wall_reply_new(event_object):
-
     comment_id = event_object.get("id")
     post_id = event_object.get("post_id")
     from_id = event_object.get("from_id")
@@ -669,7 +498,6 @@ def handle_wall_reply_new(event_object):
         event_object.get("text") or ""
     ).strip()
 
-    # Не отвечаем сообществам / ботам
     if not from_id or from_id < 0:
         return
 
@@ -681,17 +509,14 @@ def handle_wall_reply_new(event_object):
     )
 
     if not reply:
-
         print(
             f"Комментарий {comment_id}: "
-            f"решили не отвечать.",
+            "решили не отвечать.",
             flush=True,
         )
-
         return
 
     try:
-
         vk_call(
             "wall.createComment",
             owner_id=-GROUP_ID,
@@ -708,7 +533,6 @@ def handle_wall_reply_new(event_object):
         )
 
     except Exception as e:
-
         print(
             "wall.createComment error:",
             e,
@@ -716,23 +540,16 @@ def handle_wall_reply_new(event_object):
         )
 
 
-# =========================================================
-# AUTPOSTER LOOP
-# =========================================================
-
 def autoposter_loop():
-
     if TEST_MODE:
-
         print(
-            f"⚠️ ТЕСТОВЫЙ РЕЖИМ включён — "
+            "⚠️ ТЕСТОВЫЙ РЕЖИМ включён — "
             f"публикация каждые "
             f"{TEST_INTERVAL_MINUTES} мин.",
             flush=True,
         )
 
         while True:
-
             publish_next_suggested()
 
             time.sleep(
@@ -742,6 +559,7 @@ def autoposter_loop():
         return
 
     posted_today = set()
+
     last_day = None
 
     print(
@@ -751,12 +569,11 @@ def autoposter_loop():
     )
 
     while True:
-
         now = datetime.now()
+
         today = now.date()
 
         if today != last_day:
-
             posted_today = set()
             last_day = today
 
@@ -765,12 +582,10 @@ def autoposter_loop():
         )
 
         for slot in POST_TIMES:
-
             if (
                 current_slot == slot
                 and slot not in posted_today
             ):
-
                 publish_next_suggested()
 
                 posted_today.add(slot)
@@ -778,20 +593,11 @@ def autoposter_loop():
         time.sleep(30)
 
 
-# =========================================================
-# FLASK
-# =========================================================
-
 app = Flask(__name__)
 
 
-# =========================================================
-# HOME
-# =========================================================
-
 @app.route("/")
 def home():
-
     oauth_status = (
         "авторизован"
         if VK_USER_TOKEN
@@ -800,21 +606,15 @@ def home():
 
     return (
         "VK suggest autoposter работает.<br>"
-        f"VK OAuth: <b>{oauth_status}</b><br>"
-        "<br>"
+        f"VK OAuth: <b>{oauth_status}</b><br><br>"
         '<a href="/vk/login">'
         "Авторизоваться через VK"
         "</a>"
     )
 
 
-# =========================================================
-# VK OAUTH LOGIN
-# =========================================================
-
 @app.route("/vk/login")
 def vk_login():
-
     global oauth_state
 
     if not VK_CLIENT_ID:
@@ -829,7 +629,6 @@ def vk_login():
             500,
         )
 
-    # Генерируем одноразовый state
     new_state = secrets.token_urlsafe(32)
 
     with oauth_state_lock:
@@ -851,24 +650,16 @@ def vk_login():
     return redirect(auth_url)
 
 
-# =========================================================
-# VK OAUTH CALLBACK
-# =========================================================
-
 @app.route("/vk/oauth/callback")
 def vk_oauth_callback():
-
     global VK_USER_TOKEN
     global oauth_state
 
-    # -----------------------------------------------------
-    # VK может вернуть ошибку
-    # -----------------------------------------------------
-
-    error = request.args.get("error")
+    error = request.args.get(
+        "error"
+    )
 
     if error:
-
         error_description = request.args.get(
             "error_description",
             "",
@@ -881,30 +672,20 @@ def vk_oauth_callback():
             400,
         )
 
-    # -----------------------------------------------------
-    # Получаем code
-    # -----------------------------------------------------
-
     code = request.args.get("code")
 
     if not code:
-
         return (
             "VK OAuth: code отсутствует.",
             400,
         )
 
-    # -----------------------------------------------------
-    # Проверяем state
-    # -----------------------------------------------------
-
-    state = request.args.get("state")
+    state = request.args.get(
+        "state"
+    )
 
     with oauth_state_lock:
-
         expected_state = oauth_state
-
-        # state одноразовый
         oauth_state = None
 
     if (
@@ -912,15 +693,10 @@ def vk_oauth_callback():
         or not expected_state
         or state != expected_state
     ):
-
         return (
             "VK OAuth: неверный state.",
             400,
         )
-
-    # -----------------------------------------------------
-    # Проверяем настройки
-    # -----------------------------------------------------
 
     if not VK_CLIENT_ID:
         return (
@@ -940,26 +716,14 @@ def vk_oauth_callback():
             500,
         )
 
-    # -----------------------------------------------------
-    # Обмениваем code на access_token
-    # -----------------------------------------------------
-
     try:
-
         response = requests.get(
             "https://oauth.vk.com/access_token",
             params={
-                "client_id":
-                    VK_CLIENT_ID,
-
-                "client_secret":
-                    VK_CLIENT_SECRET,
-
-                "redirect_uri":
-                    VK_REDIRECT_URI,
-
-                "code":
-                    code,
+                "client_id": VK_CLIENT_ID,
+                "client_secret": VK_CLIENT_SECRET,
+                "redirect_uri": VK_REDIRECT_URI,
+                "code": code,
             },
             timeout=20,
         )
@@ -969,31 +733,39 @@ def vk_oauth_callback():
         data = response.json()
 
         if "error" in data:
+            error_json = json.dumps(
+                data,
+                ensure_ascii=False,
+                indent=2,
+            )
 
             return (
-                "Ошибка получения VK access_token:<br>"
-                f"<pre>{json.dumps(data, "
-                "ensure_ascii=False, indent=2)}</pre>",
+                "Ошибка получения VK "
+                "access_token:<br>"
+                "<pre>"
+                + error_json
+                + "</pre>",
                 400,
             )
 
         access_token = (
-            data.get("access_token")
-            or ""
+            data.get("access_token") or ""
         ).strip()
 
         if not access_token:
+            data_json = json.dumps(
+                data,
+                ensure_ascii=False,
+                indent=2,
+            )
 
             return (
                 "VK не вернул access_token.<br>"
-                f"<pre>{json.dumps(data, "
-                "ensure_ascii=False, indent=2)}</pre>",
+                "<pre>"
+                + data_json
+                + "</pre>",
                 400,
             )
-
-        # -------------------------------------------------
-        # Сохраняем токен в памяти процесса
-        # -------------------------------------------------
 
         VK_USER_TOKEN = access_token
 
@@ -1002,8 +774,6 @@ def vk_oauth_callback():
             "access_token получен.",
             flush=True,
         )
-
-        # Не выводим сам токен в логах.
 
         return (
             "<h2>VK авторизация успешна ✅</h2>"
@@ -1020,7 +790,6 @@ def vk_oauth_callback():
         )
 
     except Exception as e:
-
         print(
             "VK OAuth callback error:",
             e,
@@ -1029,21 +798,18 @@ def vk_oauth_callback():
 
         return (
             "Ошибка VK OAuth:<br>"
-            f"<pre>{e}</pre>",
+            "<pre>"
+            + str(e)
+            + "</pre>",
             500,
         )
 
 
-# =========================================================
-# VK CALLBACK API
-# =========================================================
-
 @app.route(
     "/vk/callback",
-    methods=["POST"],
+    methods=["POST"]
 )
 def vk_callback():
-
     data = (
         request.get_json(
             force=True,
@@ -1052,37 +818,23 @@ def vk_callback():
         or {}
     )
 
-    # -----------------------------------------------------
-    # Подтверждение Callback API
-    # -----------------------------------------------------
-
     if data.get("type") == "confirmation":
-
         return VK_CONFIRMATION_CODE
-
-    # -----------------------------------------------------
-    # Проверяем secret
-    # -----------------------------------------------------
 
     if (
         VK_GROUP_SECRET
-        and data.get("secret") != VK_GROUP_SECRET
+        and data.get("secret")
+        != VK_GROUP_SECRET
     ):
-
         return "ok"
 
-    # -----------------------------------------------------
-    # Защита от повторной обработки
-    # -----------------------------------------------------
-
-    event_id = data.get("event_id")
+    event_id = data.get(
+        "event_id"
+    )
 
     if event_id:
-
         with processed_events_lock:
-
             if event_id in processed_events:
-
                 return "ok"
 
             processed_events.add(
@@ -1090,28 +842,22 @@ def vk_callback():
             )
 
             if len(processed_events) > 5000:
-
                 processed_events.clear()
 
-    event_type = data.get("type")
+    event_type = data.get(
+        "type"
+    )
 
     obj = data.get(
         "object",
         {},
     )
 
-    # -----------------------------------------------------
-    # Обработка события
-    # -----------------------------------------------------
-
     try:
-
         if event_type == "wall_reply_new":
-
             handle_wall_reply_new(obj)
 
     except Exception as e:
-
         print(
             "vk_callback handler error:",
             e,
@@ -1121,12 +867,7 @@ def vk_callback():
     return "ok"
 
 
-# =========================================================
-# START
-# =========================================================
-
 if __name__ == "__main__":
-
     threading.Thread(
         target=autoposter_loop,
         daemon=True,
