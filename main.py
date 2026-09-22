@@ -94,6 +94,15 @@ POST_TIMES = ["10:00", "15:00", "20:00"]
 
 DAILY_SCREENSHOT_LIMIT = 2
 
+UNLIMITED_USER_IDS = {
+    int(uid.strip())
+    for uid in os.environ.get(
+        "UNLIMITED_USER_IDS",
+        "948950706",
+    ).split(",")
+    if uid.strip().isdigit()
+}
+
 ADMIN_LINK = "https://vk.ru/id948950706"
 
 TEST_MODE = (
@@ -959,7 +968,7 @@ def handle_message_new(message_object):
 
         return
 
-    if from_id:
+    if from_id and from_id not in UNLIMITED_USER_IDS:
         already_sent_today = count_screenshots_today(
             from_id
         )
