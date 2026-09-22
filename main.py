@@ -28,12 +28,11 @@ VK_REDIRECT_URI
 """
 
 import os
-import time
 import json
 import random
 import threading
 import secrets
-from datetime import datetime, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
 from urllib.parse import urlencode
 
@@ -90,8 +89,6 @@ GROQ_TEXT_MODEL_BACKUP = os.environ.get(
     "openai/gpt-oss-20b",
 )
 
-POST_TIMES = ["10:00", "15:00", "20:00"]
-
 DAILY_SCREENSHOT_LIMIT = 2
 
 UNLIMITED_USER_IDS = {
@@ -105,15 +102,11 @@ UNLIMITED_USER_IDS = {
 
 ADMIN_LINK = "https://vk.ru/id948950706"
 
-TEST_MODE = (
-    os.environ.get("TEST_MODE", "0").strip() == "1"
-)
-
-TEST_INTERVAL_MINUTES = int(
+ADMIN_VK_ID = int(
     os.environ.get(
-        "TEST_INTERVAL_MINUTES",
-        "10"
-    ) or 10
+        "ADMIN_VK_ID",
+        "948950706"
+    )
 )
 
 groq_client = (
@@ -243,100 +236,6 @@ def save_token_to_supabase(token):
         )
 
 
-def enqueue_suggestion(attachment_str, author_id, post_text):
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        print(
-            "Supabase не настроен — "
-            "нечего в очередь класть.",
-            flush=True,
-        )
-        return
-
-    try:
-        response = requests.post(
-            _supabase_rest_url("suggest_queue"),
-            json={
-                "attachment": attachment_str,
-                "author_id": author_id,
-                "post_text": post_text,
-            },
-            headers={
-                "apikey": SUPABASE_KEY,
-                "Authorization": f"Bearer {SUPABASE_KEY}",
-                "Content-Type": "application/json",
-            },
-            timeout=10,
-        )
-
-        response.raise_for_status()
-
-        print(
-            "✅ Скрин добавлен в очередь.",
-            flush=True,
-        )
-
-    except Exception as e:
-        print(
-            "Supabase enqueue error:",
-            e,
-            flush=True,
-        )
-
-
-def dequeue_oldest_suggestion():
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        return None
-
-    try:
-        response = requests.get(
-            _supabase_rest_url("suggest_queue"),
-            params={
-                "select": "*",
-                "order": "created_at.asc",
-                "limit": 1,
-            },
-            headers={
-                "apikey": SUPABASE_KEY,
-                "Authorization": f"Bearer {SUPABASE_KEY}",
-            },
-            timeout=10,
-        )
-
-        response.raise_for_status()
-
-        rows = response.json()
-
-        if not rows:
-            return None
-
-        row = rows[0]
-
-        delete_response = requests.delete(
-            _supabase_rest_url("suggest_queue"),
-            params={
-                "id": f"eq.{row['id']}",
-            },
-            headers={
-                "apikey": SUPABASE_KEY,
-                "Authorization": f"Bearer {SUPABASE_KEY}",
-            },
-            timeout=10,
-        )
-
-        delete_response.raise_for_status()
-
-        return row
-
-    except Exception as e:
-        print(
-            "Supabase dequeue error:",
-            e,
-            flush=True,
-        )
-
-        return None
-
-
 def _moscow_day_start_iso():
     now_msk = datetime.now(MOSCOW_TZ)
 
@@ -409,94 +308,6 @@ def log_screenshot(author_id):
             e,
             flush=True,
         )
-
-
-def get_queue_length():
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        return 0
-
-    try:
-        response = requests.get(
-            _supabase_rest_url("suggest_queue"),
-            params={
-                "select": "id",
-            },
-            headers={
-                "apikey": SUPABASE_KEY,
-                "Authorization": f"Bearer {SUPABASE_KEY}",
-            },
-            timeout=10,
-        )
-
-        response.raise_for_status()
-
-        return len(response.json())
-
-    except Exception as e:
-        print(
-            "Supabase get_queue_length error:",
-            e,
-            flush=True,
-        )
-
-        return 0
-
-
-MONTH_NAMES_RU = [
-    "января", "февраля", "марта", "апреля",
-    "мая", "июня", "июля", "августа",
-    "сентября", "октября", "ноября", "декабря",
-]
-
-
-def nth_upcoming_slot(position):
-    """
-    Возвращает datetime (МСК) слота публикации, который
-    будет position-м по счёту от текущего момента
-    (1 = ближайший следующий слот).
-    """
-
-    now = datetime.now(MOSCOW_TZ)
-
-    found = []
-
-    day_offset = 0
-
-    while len(found) < position:
-        day = now + timedelta(days=day_offset)
-
-        for slot in POST_TIMES:
-            hour, minute = map(int, slot.split(":"))
-
-            candidate = day.replace(
-                hour=hour,
-                minute=minute,
-                second=0,
-                microsecond=0,
-            )
-
-            if candidate > now:
-                found.append(candidate)
-
-        day_offset += 1
-
-    return found[position - 1]
-
-
-def format_slot_time(dt):
-    today = datetime.now(MOSCOW_TZ).date()
-
-    time_str = dt.strftime("%H:%M")
-
-    if dt.date() == today:
-        return f"сегодня в {time_str} (МСК)"
-
-    if dt.date() == today + timedelta(days=1):
-        return f"завтра в {time_str} (МСК)"
-
-    month_name = MONTH_NAMES_RU[dt.month - 1]
-
-    return f"{dt.day} {month_name} в {time_str} (МСК)"
 
 
 def send_message(user_id, text):
@@ -745,68 +556,6 @@ def analyze_screenshot(photo_url):
         return fallback
 
 
-def publish_next_suggested():
-    if not VK_TOKEN or not GROUP_ID:
-        print(
-            "VK_TOKEN / VK_GROUP_ID не заданы.",
-            flush=True,
-        )
-        return
-
-    row = dequeue_oldest_suggestion()
-
-    if not row:
-        print(
-            "Очередь пуста.",
-            flush=True,
-        )
-        return
-
-    attachment_str = row.get("attachment")
-    author_id = row.get("author_id")
-    post_text = (row.get("post_text") or "").strip()
-
-    if not attachment_str or not post_text:
-        print(
-            "Некорректная запись в очереди, "
-            "пропускаем.",
-            flush=True,
-        )
-        return
-
-    mention = get_user_mention(author_id)
-
-    message = (
-        f"{post_text}\n\n"
-        f"Прислал: {mention}\n\n"
-        "Хочешь поделиться своим результатом боя "
-        "или дропом? Пиши нам в сообщения "
-        "сообщества! 📩"
-    )
-
-    try:
-        vk_call(
-            "wall.post",
-            owner_id=-GROUP_ID,
-            from_group=1,
-            message=message,
-            attachments=attachment_str,
-        )
-
-        print(
-            f"Опубликован пост из очереди, "
-            f"автор {mention}",
-            flush=True,
-        )
-
-    except Exception as e:
-        print(
-            "wall.post error:",
-            e,
-            flush=True,
-        )
-
-
 COMMENT_SYSTEM_PROMPT = (
     "Ты — живой участник геймерского паблика ВКонтакте "
     "про World of Tanks Blitz. Под постами со скринами "
@@ -1019,80 +768,25 @@ def handle_message_new(message_object):
 
         return
 
-    attachment_str = (
-        f"photo{photo['owner_id']}_{photo['id']}"
-    )
+    mention = get_user_mention(from_id)
 
-    queue_position = get_queue_length() + 1
-
-    enqueue_suggestion(
-        attachment_str,
-        from_id,
-        ai_result["text"],
+    send_message(
+        ADMIN_VK_ID,
+        "📝 Готовый пост:\n\n"
+        f"{ai_result['text']}\n\n"
+        f"Прислал: {mention}\n\n"
+        f"Фото: {photo_url}",
     )
 
     if from_id:
-        eta = nth_upcoming_slot(queue_position)
-
         send_message(
             from_id,
-            "Принято! Скрин в очереди "
-            f"{queue_position}-м по счёту. "
-            f"Пост выйдет примерно {format_slot_time(eta)}.",
+            f"{ai_result['text']}\n\n"
+            "Хочешь, чтобы скрин попал в паблик? "
+            "Отправь его через «Предложить новость» "
+            "на стене нашего сообщества — можешь "
+            "вставить туда этот текст 👆",
         )
-
-
-def autoposter_loop():
-    if TEST_MODE:
-        print(
-            "⚠️ ТЕСТОВЫЙ РЕЖИМ включён — "
-            f"публикация каждые "
-            f"{TEST_INTERVAL_MINUTES} мин.",
-            flush=True,
-        )
-
-        while True:
-            publish_next_suggested()
-
-            time.sleep(
-                TEST_INTERVAL_MINUTES * 60
-            )
-
-        return
-
-    posted_today = set()
-
-    last_day = None
-
-    print(
-        f"Автопостер запущен. "
-        f"Слоты: {POST_TIMES}",
-        flush=True,
-    )
-
-    while True:
-        now = datetime.now(MOSCOW_TZ)
-
-        today = now.date()
-
-        if today != last_day:
-            posted_today = set()
-            last_day = today
-
-        current_slot = now.strftime(
-            "%H:%M"
-        )
-
-        for slot in POST_TIMES:
-            if (
-                current_slot == slot
-                and slot not in posted_today
-            ):
-                publish_next_suggested()
-
-                posted_today.add(slot)
-
-        time.sleep(30)
 
 
 app = Flask(__name__)
@@ -1144,7 +838,7 @@ def vk_login():
         "client_id": VK_CLIENT_ID,
         "redirect_uri": VK_REDIRECT_URI,
         "response_type": "code",
-        "scope": "wall,photos",
+        "scope": "wall,photos,offline",
         "state": new_state,
     }
 
@@ -1274,6 +968,8 @@ def vk_oauth_callback():
             )
 
         VK_USER_TOKEN = access_token
+
+        save_token_to_supabase(access_token)
 
         print(
             "✅ VK OAuth: пользовательский "
@@ -1490,11 +1186,6 @@ def vk_callback():
 
 if __name__ == "__main__":
     load_token_from_supabase()
-
-    threading.Thread(
-        target=autoposter_loop,
-        daemon=True,
-    ).start()
 
     port = int(
         os.environ.get(
