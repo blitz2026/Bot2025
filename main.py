@@ -30,14 +30,18 @@ VK_REDIRECT_URI
 import os
 import time
 import json
+import random
 import threading
 import secrets
-from datetime import datetime
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from urllib.parse import urlencode
 
 import requests
 from flask import Flask, request, redirect
 from groq import Groq
+
+MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
 
 VK_API = "https://api.vk.com/method"
@@ -81,7 +85,11 @@ GROQ_TEXT_MODEL = os.environ.get(
     "llama-3.3-70b-versatile",
 )
 
-POST_TIMES = ["12:00", "20:00"]
+POST_TIMES = ["10:00", "15:00", "20:00"]
+
+DAILY_SCREENSHOT_LIMIT = 2
+
+ADMIN_LINK = "https://vk.ru/id948950706"
 
 TEST_MODE = (
     os.environ.get("TEST_MODE", "0").strip() == "1"
@@ -219,6 +227,329 @@ def save_token_to_supabase(token):
             e,
             flush=True,
         )
+
+
+def enqueue_suggestion(attachment_str, author_id, post_text):
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        print(
+            "Supabase не настроен — "
+            "нечего в очередь класть.",
+            flush=True,
+        )
+        return
+
+    try:
+        response = requests.post(
+            _supabase_rest_url("suggest_queue"),
+            json={
+                "attachment": attachment_str,
+                "author_id": author_id,
+                "post_text": post_text,
+            },
+            headers={
+                "apikey": SUPABASE_KEY,
+                "Authorization": f"Bearer {SUPABASE_KEY}",
+                "Content-Type": "application/json",
+            },
+            timeout=10,
+        )
+
+        response.raise_for_status()
+
+        print(
+            "✅ Скрин добавлен в очередь.",
+            flush=True,
+        )
+
+    except Exception as e:
+        print(
+            "Supabase enqueue error:",
+            e,
+            flush=True,
+        )
+
+
+def dequeue_oldest_suggestion():
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return None
+
+    try:
+        response = requests.get(
+            _supabase_rest_url("suggest_queue"),
+            params={
+                "select": "*",
+                "order": "created_at.asc",
+                "limit": 1,
+            },
+            headers={
+                "apikey": SUPABASE_KEY,
+                "Authorization": f"Bearer {SUPABASE_KEY}",
+            },
+            timeout=10,
+        )
+
+        response.raise_for_status()
+
+        rows = response.json()
+
+        if not rows:
+            return None
+
+        row = rows[0]
+
+        delete_response = requests.delete(
+            _supabase_rest_url("suggest_queue"),
+            params={
+                "id": f"eq.{row['id']}",
+            },
+            headers={
+                "apikey": SUPABASE_KEY,
+                "Authorization": f"Bearer {SUPABASE_KEY}",
+            },
+            timeout=10,
+        )
+
+        delete_response.raise_for_status()
+
+        return row
+
+    except Exception as e:
+        print(
+            "Supabase dequeue error:",
+            e,
+            flush=True,
+        )
+
+        return None
+
+
+def _moscow_day_start_iso():
+    now_msk = datetime.now(MOSCOW_TZ)
+
+    day_start = now_msk.replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+
+    return day_start.isoformat()
+
+
+def count_screenshots_today(author_id):
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return 0
+
+    try:
+        response = requests.get(
+            _supabase_rest_url("screenshot_log"),
+            params={
+                "select": "id",
+                "author_id": f"eq.{author_id}",
+                "created_at": f"gte.{_moscow_day_start_iso()}",
+            },
+            headers={
+                "apikey": SUPABASE_KEY,
+                "Authorization": f"Bearer {SUPABASE_KEY}",
+            },
+            timeout=10,
+        )
+
+        response.raise_for_status()
+
+        return len(response.json())
+
+    except Exception as e:
+        print(
+            "Supabase count_screenshots_today error:",
+            e,
+            flush=True,
+        )
+
+        return 0
+
+
+def log_screenshot(author_id):
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return
+
+    try:
+        response = requests.post(
+            _supabase_rest_url("screenshot_log"),
+            json={
+                "author_id": author_id,
+            },
+            headers={
+                "apikey": SUPABASE_KEY,
+                "Authorization": f"Bearer {SUPABASE_KEY}",
+                "Content-Type": "application/json",
+            },
+            timeout=10,
+        )
+
+        response.raise_for_status()
+
+    except Exception as e:
+        print(
+            "Supabase log_screenshot error:",
+            e,
+            flush=True,
+        )
+
+
+def get_queue_length():
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return 0
+
+    try:
+        response = requests.get(
+            _supabase_rest_url("suggest_queue"),
+            params={
+                "select": "id",
+            },
+            headers={
+                "apikey": SUPABASE_KEY,
+                "Authorization": f"Bearer {SUPABASE_KEY}",
+            },
+            timeout=10,
+        )
+
+        response.raise_for_status()
+
+        return len(response.json())
+
+    except Exception as e:
+        print(
+            "Supabase get_queue_length error:",
+            e,
+            flush=True,
+        )
+
+        return 0
+
+
+MONTH_NAMES_RU = [
+    "января", "февраля", "марта", "апреля",
+    "мая", "июня", "июля", "августа",
+    "сентября", "октября", "ноября", "декабря",
+]
+
+
+def nth_upcoming_slot(position):
+    """
+    Возвращает datetime (МСК) слота публикации, который
+    будет position-м по счёту от текущего момента
+    (1 = ближайший следующий слот).
+    """
+
+    now = datetime.now(MOSCOW_TZ)
+
+    found = []
+
+    day_offset = 0
+
+    while len(found) < position:
+        day = now + timedelta(days=day_offset)
+
+        for slot in POST_TIMES:
+            hour, minute = map(int, slot.split(":"))
+
+            candidate = day.replace(
+                hour=hour,
+                minute=minute,
+                second=0,
+                microsecond=0,
+            )
+
+            if candidate > now:
+                found.append(candidate)
+
+        day_offset += 1
+
+    return found[position - 1]
+
+
+def format_slot_time(dt):
+    today = datetime.now(MOSCOW_TZ).date()
+
+    time_str = dt.strftime("%H:%M")
+
+    if dt.date() == today:
+        return f"сегодня в {time_str} (МСК)"
+
+    if dt.date() == today + timedelta(days=1):
+        return f"завтра в {time_str} (МСК)"
+
+    month_name = MONTH_NAMES_RU[dt.month - 1]
+
+    return f"{dt.day} {month_name} в {time_str} (МСК)"
+
+
+def send_message(user_id, text):
+    try:
+        vk_call(
+            "messages.send",
+            user_id=user_id,
+            message=text,
+            random_id=random.randint(
+                1,
+                2 ** 31 - 1,
+            ),
+        )
+
+    except Exception as e:
+        print(
+            "messages.send error:",
+            e,
+            flush=True,
+        )
+
+
+def generate_canned_reply(text):
+    lowered = (text or "").lower()
+
+    ad_words = (
+        "реклам", "прорекл", "пиар",
+        "продвин", "разместить пост",
+    )
+
+    if any(word in lowered for word in ad_words):
+        return (
+            "По вопросам рекламы клана/канала — "
+            f"пиши админу: {ADMIN_LINK}"
+        )
+
+    bot_words = (
+        "ты бот", "ты человек", "живой человек",
+        "с кем я", "кто ты", "человек ли ты",
+    )
+
+    if any(word in lowered for word in bot_words):
+        return (
+            "Я автоматический бот 🤖, здесь нет "
+            "живых модераторов. Присылай скрин из "
+            "World of Tanks Blitz — опубликую его "
+            "в паблике!"
+        )
+
+    greeting_words = (
+        "привет", "здарова", "хай", "ку",
+        "здравствуй", "прив",
+    )
+
+    if any(word in lowered for word in greeting_words):
+        return (
+            "Привет! Я бот 🤖. Пришли скриншот из "
+            "World of Tanks Blitz — опубликую его "
+            "в паблике в порядке очереди."
+        )
+
+    return (
+        "Я бот 🤖 и публикую скрины из World of "
+        "Tanks Blitz, присланные в это сообщение. "
+        "Просто пришли фото! По остальным вопросам "
+        f"— пиши админу: {ADMIN_LINK}"
+    )
 
 
 def get_suggested_posts(count=1, offset=0):
@@ -406,93 +737,31 @@ def publish_next_suggested():
         )
         return
 
-    if not VK_USER_TOKEN:
+    row = dequeue_oldest_suggestion()
+
+    if not row:
         print(
-            "⚠️ VK_USER_TOKEN отсутствует.",
-            flush=True,
-        )
-
-        print(
-            "Открой мини-приложение VK для авторизации.",
-            flush=True,
-        )
-
-        return
-
-    try:
-        items = get_suggested_posts(count=1)
-
-    except Exception as e:
-        print(
-            "get_suggested_posts error:",
-            e,
+            "Очередь пуста.",
             flush=True,
         )
         return
 
-    if not items:
+    attachment_str = row.get("attachment")
+    author_id = row.get("author_id")
+    post_text = (row.get("post_text") or "").strip()
+
+    if not attachment_str or not post_text:
         print(
-            "Предложка пуста.",
+            "Некорректная запись в очереди, "
+            "пропускаем.",
             flush=True,
         )
         return
 
-    post = items[0]
-
-    post_id = post["id"]
-
-    author_id = post.get("from_id")
-
-    photo = next(
-        (
-            attachment["photo"]
-            for attachment in post.get(
-                "attachments",
-                []
-            )
-            if attachment.get("type") == "photo"
-        ),
-        None,
-    )
-
-    if not photo:
-        _safe_delete(post_id)
-
-        print(
-            f"Пост {post_id} без фото — "
-            "убран из очереди.",
-            flush=True,
-        )
-
-        return
-
-    photo_url = get_biggest_photo_url(photo)
-
-    ai_result = analyze_screenshot(
-        photo_url
-    )
-
-    if not ai_result["is_relevant"]:
-        _safe_delete(post_id)
-
-        print(
-            f"Пост {post_id} отклонён AI "
-            "как нерелевантный.",
-            flush=True,
-        )
-
-        return
-
-    attachment_str = (
-        f"photo{photo['owner_id']}_{photo['id']}"
-    )
-
-    mention = get_user_mention(
-        author_id
-    )
+    mention = get_user_mention(author_id)
 
     message = (
-        f"{ai_result['text']}\n\n"
+        f"{post_text}\n\n"
         f"Прислал: {mention}"
     )
 
@@ -505,10 +774,8 @@ def publish_next_suggested():
             attachments=attachment_str,
         )
 
-        _safe_delete(post_id)
-
         print(
-            f"Опубликован пост {post_id}, "
+            f"Опубликован пост из очереди, "
             f"автор {mention}",
             flush=True,
         )
@@ -630,6 +897,104 @@ def handle_wall_reply_new(event_object):
         )
 
 
+def handle_message_new(message_object):
+    message = message_object.get("message", {})
+
+    from_id = message.get("from_id")
+
+    text = (message.get("text") or "").strip()
+
+    attachments = message.get(
+        "attachments",
+        [],
+    )
+
+    photo = next(
+        (
+            attachment["photo"]
+            for attachment in attachments
+            if attachment.get("type") == "photo"
+        ),
+        None,
+    )
+
+    if not photo:
+        reply = generate_canned_reply(text)
+
+        if reply and from_id:
+            send_message(from_id, reply)
+
+        return
+
+    if from_id:
+        already_sent_today = count_screenshots_today(
+            from_id
+        )
+
+        if already_sent_today >= DAILY_SCREENSHOT_LIMIT:
+            send_message(
+                from_id,
+                "Сегодня ты уже прислал(а) "
+                f"максимум скринов ({DAILY_SCREENSHOT_LIMIT} шт). "
+                "Приходи завтра! 🙂",
+            )
+
+            print(
+                f"Лимит скринов исчерпан для {from_id}.",
+                flush=True,
+            )
+
+            return
+
+    photo_url = get_biggest_photo_url(photo)
+
+    ai_result = analyze_screenshot(
+        photo_url
+    )
+
+    if from_id:
+        log_screenshot(from_id)
+
+    if not ai_result["is_relevant"]:
+        print(
+            "Скрин в ЛС отклонён AI "
+            "как нерелевантный.",
+            flush=True,
+        )
+
+        if from_id:
+            send_message(
+                from_id,
+                "Этот скрин не подходит для паблика "
+                "(не по теме или не разобрать, что на "
+                "нём). Попробуй прислать другой!",
+            )
+
+        return
+
+    attachment_str = (
+        f"photo{photo['owner_id']}_{photo['id']}"
+    )
+
+    queue_position = get_queue_length() + 1
+
+    enqueue_suggestion(
+        attachment_str,
+        from_id,
+        ai_result["text"],
+    )
+
+    if from_id:
+        eta = nth_upcoming_slot(queue_position)
+
+        send_message(
+            from_id,
+            "Принято! Скрин в очереди "
+            f"{queue_position}-м по счёту. "
+            f"Пост выйдет примерно {format_slot_time(eta)}.",
+        )
+
+
 def autoposter_loop():
     if TEST_MODE:
         print(
@@ -659,7 +1024,7 @@ def autoposter_loop():
     )
 
     while True:
-        now = datetime.now()
+        now = datetime.now(MOSCOW_TZ)
 
         today = now.date()
 
@@ -1062,6 +1427,9 @@ def vk_callback():
     try:
         if event_type == "wall_reply_new":
             handle_wall_reply_new(obj)
+
+        elif event_type == "message_new":
+            handle_message_new(obj)
 
     except Exception as e:
         print(
