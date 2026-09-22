@@ -112,8 +112,8 @@ TEST_MODE = (
 TEST_INTERVAL_MINUTES = int(
     os.environ.get(
         "TEST_INTERVAL_MINUTES",
-        "2"
-    ) or 2
+        "10"
+    ) or 10
 )
 
 groq_client = (
@@ -601,6 +601,65 @@ def get_biggest_photo_url(photo):
     return biggest.get("url")
 
 
+def reupload_photo_to_wall(photo_url):
+    if not photo_url:
+        return None
+
+    try:
+        upload_server = vk_call(
+            "photos.getWallUploadServer",
+            group_id=GROUP_ID,
+        )
+
+        image_response = requests.get(
+            photo_url,
+            timeout=20,
+        )
+        image_response.raise_for_status()
+
+        files = {
+            "photo": (
+                "photo.jpg",
+                image_response.content,
+            )
+        }
+
+        upload_response = requests.post(
+            upload_server["upload_url"],
+            files=files,
+            timeout=20,
+        )
+        upload_response.raise_for_status()
+
+        upload_data = upload_response.json()
+
+        saved = vk_call(
+            "photos.saveWallPhoto",
+            group_id=GROUP_ID,
+            photo=upload_data.get("photo"),
+            server=upload_data.get("server"),
+            hash=upload_data.get("hash"),
+        )
+
+        if not saved:
+            return None
+
+        saved_photo = saved[0]
+
+        return (
+            f"photo{saved_photo['owner_id']}"
+            f"_{saved_photo['id']}"
+        )
+
+    except Exception as e:
+        print(
+            "reupload_photo_to_wall error:",
+            e,
+            flush=True,
+        )
+        return None
+
+
 def get_user_mention(user_id):
     if not user_id or user_id <= 0:
         return "аноним"
@@ -1019,14 +1078,26 @@ def handle_message_new(message_object):
 
         return
 
-    access_key = photo.get("access_key")
-
-    attachment_str = (
-        f"photo{photo['owner_id']}_{photo['id']}"
+    attachment_str = reupload_photo_to_wall(
+        photo_url
     )
 
-    if access_key:
-        attachment_str += f"_{access_key}"
+    if not attachment_str:
+        print(
+            "Не удалось перезалить фото на стену, "
+            "скрин отклонён.",
+            flush=True,
+        )
+
+        if from_id:
+            send_message(
+                from_id,
+                "Не получилось обработать скрин "
+                "технически, попробуй прислать "
+                "ещё раз чуть позже 🙏",
+            )
+
+        return
 
     queue_position = get_queue_length() + 1
 
