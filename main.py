@@ -135,7 +135,7 @@ def get_suggested_posts(count=1, offset=0):
     if not VK_USER_TOKEN:
         raise RuntimeError(
             "VK_USER_TOKEN отсутствует. "
-            "Открой /vk/login и пройди авторизацию VK."
+            "Открой мини-приложение VK и авторизуйся."
         )
 
     response = vk_call(
@@ -323,7 +323,7 @@ def publish_next_suggested():
         )
 
         print(
-            "Открой /vk/login для авторизации.",
+            "Открой мини-приложение VK для авторизации.",
             flush=True,
         )
 
@@ -608,8 +608,12 @@ def home():
         "VK suggest autoposter работает.<br>"
         f"VK OAuth: <b>{oauth_status}</b><br><br>"
         '<a href="/vk/login">'
-        "Авторизоваться через VK"
-        "</a>"
+        "Авторизоваться через VK (старый способ, "
+        "не работает для мини-приложений)"
+        "</a><br>"
+        '<a href="/vk/miniapp">'
+        "Открыть страницу авторизации мини-приложения"
+        "</a>'
     )
 
 
@@ -803,6 +807,116 @@ def vk_oauth_callback():
             + "</pre>",
             500,
         )
+
+
+@app.route("/vk/miniapp")
+def vk_miniapp():
+    """
+    Страница авторизации мини-приложения VK.
+    Открывается ВНУТРИ VK (например vk.com/app<ID>).
+    Получает пользовательский токен через VK Bridge
+    (VKWebAppGetAuthToken) и отправляет его на сервер
+    через POST /vk/save-token.
+    """
+
+    app_id = VK_CLIENT_ID
+
+    html = f"""<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Авторизация БлицСеть</title>
+<script src="https://unpkg.com/@vkontakte/vk-bridge/dist/browser.min.js"></script>
+</head>
+<body style="font-family: sans-serif; padding: 20px;">
+<h3>Авторизация мини-приложения</h3>
+<p id="status">Подключение к VK...</p>
+
+<script>
+  var statusEl = document.getElementById('status');
+
+  function setStatus(text) {{
+    statusEl.textContent = text;
+  }}
+
+  vkBridge.send('VKWebAppInit')
+    .then(function () {{
+      setStatus('Запрашиваем доступ...');
+
+      return vkBridge.send('VKWebAppGetAuthToken', {{
+        app_id: {app_id},
+        scope: 'wall,photos'
+      }});
+    }})
+    .then(function (data) {{
+      if (!data || !data.access_token) {{
+        setStatus('VK не вернул токен.');
+        return;
+      }}
+
+      setStatus('Токен получен, сохраняем на сервере...');
+
+      return fetch('/vk/save-token', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify({{ access_token: data.access_token }})
+      }})
+        .then(function (response) {{ return response.json(); }})
+        .then(function (result) {{
+          if (result && result.ok) {{
+            setStatus('Готово! Токен сохранён. Можно закрыть эту страницу.');
+          }} else {{
+            setStatus('Ошибка сохранения токена на сервере.');
+          }}
+        }});
+    }})
+    .catch(function (error) {{
+      setStatus('Ошибка: ' + JSON.stringify(error));
+    }});
+</script>
+</body>
+</html>"""
+
+    return html
+
+
+@app.route("/vk/save-token", methods=["POST"])
+def vk_save_token():
+    global VK_USER_TOKEN
+
+    data = (
+        request.get_json(
+            force=True,
+            silent=True,
+        )
+        or {}
+    )
+
+    access_token = (
+        data.get("access_token") or ""
+    ).strip()
+
+    if not access_token:
+        return (
+            json.dumps({"ok": False, "error": "no token"}),
+            400,
+            {"Content-Type": "application/json"},
+        )
+
+    VK_USER_TOKEN = access_token
+
+    print(
+        "✅ VK Mini App: пользовательский "
+        "access_token получен и сохранён.",
+        flush=True,
+    )
+
+    return (
+        json.dumps({"ok": True}),
+        200,
+        {"Content-Type": "application/json"},
+    )
 
 
 @app.route(
