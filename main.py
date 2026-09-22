@@ -605,9 +605,18 @@ def reupload_photo_to_wall(photo_url):
     if not photo_url:
         return None
 
+    if not VK_USER_TOKEN:
+        print(
+            "reupload_photo_to_wall: "
+            "VK_USER_TOKEN отсутствует.",
+            flush=True,
+        )
+        return None
+
     try:
         upload_server = vk_call(
             "photos.getWallUploadServer",
+            token=VK_USER_TOKEN,
             group_id=GROUP_ID,
         )
 
@@ -635,6 +644,7 @@ def reupload_photo_to_wall(photo_url):
 
         saved = vk_call(
             "photos.saveWallPhoto",
+            token=VK_USER_TOKEN,
             group_id=GROUP_ID,
             photo=upload_data.get("photo"),
             server=upload_data.get("server"),
