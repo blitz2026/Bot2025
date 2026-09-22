@@ -936,7 +936,7 @@ def vk_miniapp():
 
       return vkBridge.send('VKWebAppGetAuthToken', {{
         app_id: {app_id},
-        scope: 'wall,photos'
+        scope: 'wall,photos,offline'
       }});
     }})
     .then(function (data) {{
