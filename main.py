@@ -795,8 +795,7 @@ def publish_next_suggested():
 
         print(
             f"Опубликован пост из очереди, "
-            f"автор {mention}, "
-            f"attachment={attachment_str}",
+            f"автор {mention}",
             flush=True,
         )
 
@@ -1023,11 +1022,6 @@ def handle_message_new(message_object):
     attachment_str = (
         f"photo{photo['owner_id']}_{photo['id']}"
     )
-
-    access_key = photo.get("access_key")
-
-    if access_key:
-        attachment_str += f"_{access_key}"
 
     queue_position = get_queue_length() + 1
 
