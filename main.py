@@ -112,8 +112,8 @@ TEST_MODE = (
 TEST_INTERVAL_MINUTES = int(
     os.environ.get(
         "TEST_INTERVAL_MINUTES",
-        "10"
-    ) or 10
+        "2"
+    ) or 2
 )
 
 groq_client = (
@@ -654,6 +654,8 @@ PROMPT = (
     "(1–3 предложения), живым разговорным тоном, можно с "
     "эмодзи, по существу того, что видно на скрине "
     "(результат боя, урон, техника, достижение и т.п.). "
+    "Обязательно похвали или поздравь игрока с результатом "
+    "в дружеском тоне. "
     "Не придумывай цифры и детали, которых нет на "
     "изображении. Если скрин не по теме игры, нерелевантен, "
     "это спам, мем или что-то не для паблика — "
@@ -776,7 +778,10 @@ def publish_next_suggested():
 
     message = (
         f"{post_text}\n\n"
-        f"Прислал: {mention}"
+        f"Прислал: {mention}\n\n"
+        "Хочешь поделиться своим результатом боя "
+        "или дропом? Пиши нам в сообщения "
+        "сообщества! 📩"
     )
 
     try:
@@ -1014,9 +1019,14 @@ def handle_message_new(message_object):
 
         return
 
+    access_key = photo.get("access_key")
+
     attachment_str = (
         f"photo{photo['owner_id']}_{photo['id']}"
     )
+
+    if access_key:
+        attachment_str += f"_{access_key}"
 
     queue_position = get_queue_length() + 1
 
