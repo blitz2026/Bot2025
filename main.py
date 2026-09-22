@@ -51,6 +51,9 @@ VK_REDIRECT_URI = os.environ.get("VK_REDIRECT_URI", "").strip()
 
 VK_USER_TOKEN = os.environ.get("VK_USER_TOKEN", "").strip()
 
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip()
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "").strip()
+
 GROUP_ID = int(os.environ.get("VK_GROUP_ID", "0") or 0)
 
 VK_CONFIRMATION_CODE = os.environ.get(
@@ -129,6 +132,93 @@ def vk_call(method, token=None, **params):
         raise RuntimeError(data["error"])
 
     return data["response"]
+
+
+def _supabase_rest_url(path):
+    base = SUPABASE_URL.rstrip("/")
+
+    if base.endswith("/rest/v1"):
+        base = base[: -len("/rest/v1")]
+
+    return f"{base}/rest/v1/{path}"
+
+
+def load_token_from_supabase():
+    global VK_USER_TOKEN
+
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return
+
+    try:
+        response = requests.get(
+            _supabase_rest_url("bot_state"),
+            params={
+                "key": "eq.vk_user_token",
+                "select": "value",
+            },
+            headers={
+                "apikey": SUPABASE_KEY,
+                "Authorization": f"Bearer {SUPABASE_KEY}",
+            },
+            timeout=10,
+        )
+
+        response.raise_for_status()
+
+        rows = response.json()
+
+        if rows:
+            saved_value = (rows[0].get("value") or "").strip()
+
+            if saved_value:
+                VK_USER_TOKEN = saved_value
+
+                print(
+                    "✅ VK_USER_TOKEN загружен из Supabase.",
+                    flush=True,
+                )
+
+    except Exception as e:
+        print(
+            "Supabase load_token error:",
+            e,
+            flush=True,
+        )
+
+
+def save_token_to_supabase(token):
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return
+
+    try:
+        response = requests.post(
+            _supabase_rest_url("bot_state"),
+            json={
+                "key": "vk_user_token",
+                "value": token,
+            },
+            headers={
+                "apikey": SUPABASE_KEY,
+                "Authorization": f"Bearer {SUPABASE_KEY}",
+                "Content-Type": "application/json",
+                "Prefer": "resolution=merge-duplicates",
+            },
+            timeout=10,
+        )
+
+        response.raise_for_status()
+
+        print(
+            "✅ VK_USER_TOKEN сохранён в Supabase.",
+            flush=True,
+        )
+
+    except Exception as e:
+        print(
+            "Supabase save_token error:",
+            e,
+            flush=True,
+        )
 
 
 def get_suggested_posts(count=1, offset=0):
@@ -912,6 +1002,8 @@ def vk_save_token():
         flush=True,
     )
 
+    save_token_to_supabase(access_token)
+
     return (
         json.dumps({"ok": True}),
         200,
@@ -982,6 +1074,8 @@ def vk_callback():
 
 
 if __name__ == "__main__":
+    load_token_from_supabase()
+
     threading.Thread(
         target=autoposter_loop,
         daemon=True,
