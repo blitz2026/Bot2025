@@ -77,12 +77,17 @@ GROQ_API_KEY = os.environ.get(
 
 GROQ_VISION_MODEL = os.environ.get(
     "GROQ_VISION_MODEL",
-    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "qwen/qwen3.8-27b",
 )
 
 GROQ_TEXT_MODEL = os.environ.get(
     "GROQ_TEXT_MODEL",
-    "llama-3.3-70b-versatile",
+    "openai/gpt-oss-120b",
+)
+
+GROQ_TEXT_MODEL_BACKUP = os.environ.get(
+    "GROQ_TEXT_MODEL_BACKUP",
+    "openai/gpt-oss-20b",
 )
 
 POST_TIMES = ["10:00", "15:00", "20:00"]
@@ -802,43 +807,71 @@ COMMENT_SYSTEM_PROMPT = (
 )
 
 
+def _call_groq_text(model, comment_text):
+    completion = (
+        groq_client
+        .chat
+        .completions
+        .create(
+            model=model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": COMMENT_SYSTEM_PROMPT,
+                },
+                {
+                    "role": "user",
+                    "content": comment_text,
+                },
+            ],
+            max_tokens=120,
+            temperature=0.8,
+        )
+    )
+
+    return (
+        completion
+        .choices[0]
+        .message
+        .content
+        .strip()
+    )
+
+
 def generate_comment_reply(comment_text):
     if not groq_client or not comment_text:
         return ""
 
     try:
-        completion = (
-            groq_client
-            .chat
-            .completions
-            .create(
-                model=GROQ_TEXT_MODEL,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": COMMENT_SYSTEM_PROMPT,
-                    },
-                    {
-                        "role": "user",
-                        "content": comment_text,
-                    },
-                ],
-                max_tokens=120,
-                temperature=0.8,
-            )
-        )
-
-        return (
-            completion
-            .choices[0]
-            .message
-            .content
-            .strip()
+        return _call_groq_text(
+            GROQ_TEXT_MODEL,
+            comment_text,
         )
 
     except Exception as e:
         print(
-            "generate_comment_reply error:",
+            "generate_comment_reply error "
+            f"({GROQ_TEXT_MODEL}):",
+            e,
+            flush=True,
+        )
+
+    try:
+        print(
+            f"Пробуем запасную модель "
+            f"{GROQ_TEXT_MODEL_BACKUP}...",
+            flush=True,
+        )
+
+        return _call_groq_text(
+            GROQ_TEXT_MODEL_BACKUP,
+            comment_text,
+        )
+
+    except Exception as e:
+        print(
+            "generate_comment_reply error "
+            f"({GROQ_TEXT_MODEL_BACKUP}):",
             e,
             flush=True,
         )
