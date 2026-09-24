@@ -24,6 +24,9 @@ ENV (Render -> Environment):
   GROQ_VISION_MODEL      по умолчанию qwen/qwen3.8-27b
   GROQ_WHISPER_MODEL     по умолчанию whisper-large-v3-turbo
   MEDIA_DAILY_LIMIT      сколько вложений в день (по умолчанию 100)
+  CHAT_MAP               перевод номеров чатов: "2000000001:2000000003"
+                         (номер у второго бота : номер у основного),
+                         несколько пар через запятую
 """
 
 import os
@@ -38,7 +41,7 @@ from flask import Flask, request
 from groq import Groq
 
 
-MEDIA_BOT_VERSION = "M1.0"
+MEDIA_BOT_VERSION = "M1.1"
 
 
 # =========================================================
@@ -96,6 +99,30 @@ MEDIA_MAX_IMAGE_BYTES = 2_800_000
 MEDIA_MAX_AUDIO_BYTES = 20_000_000
 MEDIA_BLOCK_SECONDS = 30 * 60
 MAX_RESULT_CHARS = 600
+
+
+# Перевод номеров чатов. У разных сообществ один и тот же чат
+# имеет разный peer_id, поэтому второй бот переводит свой номер
+# в номер, под которым чат знает основной бот.
+# Формат: CHAT_MAP=2000000001:2000000003,2000000002:2000000005
+CHAT_MAP = {}
+
+for _pair in os.environ.get("CHAT_MAP", "").split(","):
+    if ":" not in _pair:
+        continue
+
+    _src, _dst = _pair.split(":", 1)
+
+    try:
+        CHAT_MAP[int(_src.strip())] = int(_dst.strip())
+    except ValueError:
+        print(f"CHAT_MAP: не понял пару '{_pair}'", flush=True)
+
+
+def map_chat_id(peer_id):
+    peer_id = int(peer_id)
+    return CHAT_MAP.get(peer_id, peer_id)
+
 
 groq_client = (
     Groq(api_key=GROQ_API_KEY)
@@ -534,9 +561,11 @@ def process_event(data):
         else f"vk:{peer_id}:{cmid}"
     )
 
+    chat_id = map_chat_id(peer_id)
+
     row = {
         "event_key": event_key,
-        "chat_id": int(peer_id),
+        "chat_id": chat_id,
         "sender_id": int(sender_id),
         "sender_name": get_vk_user_name(sender_id),
         "message_id": int(cmid) if cmid is not None else None,
@@ -554,7 +583,8 @@ def process_event(data):
     if sb_insert_with_retry(row):
         print(
             f"INBOX +1: {kind} от {sender_id} "
-            f"в чате {peer_id} ({len(result)} симв.)",
+            f"в чате {peer_id} -> {chat_id} "
+            f"({len(result)} симв.)",
             flush=True
         )
 
@@ -603,6 +633,7 @@ def home():
         "supabase": bool(SUPABASE_URL and SUPABASE_SECRET_KEY),
         "vision_model": GROQ_VISION_MODEL,
         "whisper_model": GROQ_WHISPER_MODEL,
+        "chat_map": {str(k): v for k, v in CHAT_MAP.items()},
     }, 200
 
 
@@ -658,6 +689,7 @@ if __name__ == "__main__":
         flush=True
     )
     print(f"📊 Лимит вложений в день: {MEDIA_DAILY_LIMIT}", flush=True)
+    print(f"🔀 CHAT_MAP: {CHAT_MAP if CHAT_MAP else 'нет'}", flush=True)
     print("========================================", flush=True)
 
     port = int(os.environ.get("PORT", 5000))
