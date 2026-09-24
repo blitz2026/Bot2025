@@ -1,113 +1,101 @@
 """
 =========================================================
-VK SUGGEST AUTOPOSTER — OAuth версия
+VK MEDIA BOT — «глаза и уши» для основного бота
 =========================================================
 
 Что делает:
-  - Берёт записи из предложки сообщества через wall.get
-  - wall.get выполняется пользовательским VK OAuth токеном
-  - Публикация выполняется токеном сообщества
-  - Отправляет скрин в Groq Vision
-  - Публикует текст от имени сообщества
-  - Удаляет запись из предложки
-  - Отвечает на комментарии через Callback API
+  - Получает события message_new из VK Callback API.
+  - Если в сообщении голосовое или фото, разбирает его через
+    СВОЙ ключ Groq (Whisper для голоса, vision для картинок).
+  - Кладёт результат в таблицу media_inbox в Supabase:
+    VK ID, имя, чат, подпись, текст или описание.
+  - В чат НИЧЕГО не пишет. Отвечает основной бот.
 
-ENV:
+ENV (Render -> Environment):
 
-VK_TOKEN
-VK_GROUP_ID
-GROQ_API_KEY
-VK_CONFIRMATION_CODE
-VK_GROUP_SECRET
+  VK_CONFIRMATION_CODE   строка подтверждения ЭТОГО Callback-сервера
+  VK_GROUP_SECRET        secret key этого сервера (если задан в VK)
+  GROQ_API_KEY           ключ Groq этого бота
+  SUPABASE_URL           тот же, что у основного бота
+  SUPABASE_SECRET_KEY    тот же, что у основного бота
 
-OAuth:
-
-VK_CLIENT_ID
-VK_CLIENT_SECRET
-VK_REDIRECT_URI
+  Необязательно:
+  VK_TOKEN               токен сообщества: чтобы сохранять имя автора
+  GROQ_VISION_MODEL      по умолчанию qwen/qwen3.8-27b
+  GROQ_WHISPER_MODEL     по умолчанию whisper-large-v3-turbo
+  MEDIA_DAILY_LIMIT      сколько вложений в день (по умолчанию 100)
 """
 
 import os
-import json
-import random
+import re
+import time
+import base64
 import threading
-import secrets
-from datetime import datetime
-from zoneinfo import ZoneInfo
-from urllib.parse import urlencode
+from datetime import datetime, timezone
 
 import requests
-from flask import Flask, request, redirect
+from flask import Flask, request
 from groq import Groq
 
-MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 
+MEDIA_BOT_VERSION = "M1.0"
+
+
+# =========================================================
+# CONFIG
+# =========================================================
 
 VK_API = "https://api.vk.com/method"
 VK_VERSION = "5.199"
 
 VK_TOKEN = os.environ.get("VK_TOKEN", "").strip()
 
-VK_CLIENT_ID = os.environ.get("VK_CLIENT_ID", "").strip()
-VK_CLIENT_SECRET = os.environ.get("VK_CLIENT_SECRET", "").strip()
-VK_REDIRECT_URI = os.environ.get("VK_REDIRECT_URI", "").strip()
-
-VK_USER_TOKEN = os.environ.get("VK_USER_TOKEN", "").strip()
-
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip()
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "").strip()
-
-GROUP_ID = int(os.environ.get("VK_GROUP_ID", "0") or 0)
-
 VK_CONFIRMATION_CODE = os.environ.get(
-    "VK_CONFIRMATION_CODE",
-    ""
+    "VK_CONFIRMATION_CODE", ""
 ).strip()
 
 VK_GROUP_SECRET = os.environ.get(
-    "VK_GROUP_SECRET",
-    ""
+    "VK_GROUP_SECRET", ""
 ).strip()
 
-GROQ_API_KEY = os.environ.get(
-    "GROQ_API_KEY",
-    ""
-).strip()
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
 
 GROQ_VISION_MODEL = os.environ.get(
-    "GROQ_VISION_MODEL",
-    "qwen/qwen3.8-27b",
+    "GROQ_VISION_MODEL", "qwen/qwen3.8-27b"
+).strip()
+
+GROQ_WHISPER_MODEL = os.environ.get(
+    "GROQ_WHISPER_MODEL", "whisper-large-v3-turbo"
+).strip()
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip()
+
+SUPABASE_SECRET_KEY = (
+    os.environ.get("SUPABASE_SECRET_KEY", "").strip()
+    or os.environ.get("SUPABASE_KEY", "").strip()
 )
 
-GROQ_TEXT_MODEL = os.environ.get(
-    "GROQ_TEXT_MODEL",
-    "openai/gpt-oss-120b",
-)
+if SUPABASE_URL and not SUPABASE_URL.startswith(
+    ("http://", "https://")
+):
+    SUPABASE_URL = "https://" + SUPABASE_URL
 
-GROQ_TEXT_MODEL_BACKUP = os.environ.get(
-    "GROQ_TEXT_MODEL_BACKUP",
-    "openai/gpt-oss-20b",
-)
+SUPABASE_URL = SUPABASE_URL.rstrip("/")
 
-DAILY_SCREENSHOT_LIMIT = 2
+INBOX_TABLE = "media_inbox"
 
-UNLIMITED_USER_IDS = {
-    int(uid.strip())
-    for uid in os.environ.get(
-        "UNLIMITED_USER_IDS",
-        "948950706",
-    ).split(",")
-    if uid.strip().isdigit()
-}
-
-ADMIN_LINK = "https://vk.ru/id948950706"
-
-ADMIN_VK_ID = int(
-    os.environ.get(
-        "ADMIN_VK_ID",
-        "948950706"
+try:
+    MEDIA_DAILY_LIMIT = int(
+        os.environ.get("MEDIA_DAILY_LIMIT", "100") or 100
     )
-)
+except ValueError:
+    MEDIA_DAILY_LIMIT = 100
+
+MEDIA_MAX_VOICE_SECONDS = 120
+MEDIA_MAX_IMAGE_BYTES = 2_800_000
+MEDIA_MAX_AUDIO_BYTES = 20_000_000
+MEDIA_BLOCK_SECONDS = 30 * 60
+MAX_RESULT_CHARS = 600
 
 groq_client = (
     Groq(api_key=GROQ_API_KEY)
@@ -115,1086 +103,563 @@ groq_client = (
     else None
 )
 
-oauth_state = None
-oauth_state_lock = threading.Lock()
+app = Flask(__name__)
 
-processed_events = set()
-processed_events_lock = threading.Lock()
+media_lock = threading.Lock()
+media_state = {"day": "", "count": 0, "blocked_until": 0.0}
+
+seen_events = {}
+seen_lock = threading.Lock()
+
+user_names = {}
 
 
-def vk_call(method, token=None, **params):
-    access_token = token or VK_TOKEN
+# =========================================================
+# PROMPT
+# =========================================================
 
-    if not access_token:
-        raise RuntimeError(
-            "VK access_token не задан."
-        )
+MEDIA_VISION_PROMPT = (
+    "Ты помогаешь боту игрового чата про Tanks Blitz "
+    "(World of Tanks Blitz). "
+    "Если картинка НЕ связана с Tanks Blitz или World of Tanks "
+    "(обычное фото, мем, другая игра, реклама и т.п.), "
+    "ответь ровно одним словом: НЕТ. "
+    "Если связана, опиши по-русски кратко (до 350 символов, "
+    "без списков и без вступления), что на ней. "
+    "Результат боя: победа или поражение, урон, заблокированный урон, "
+    "уничтожено, медали, ник и клан, дата. "
+    "Магазин или предложения: названия танков и наборов, цены, скидки. "
+    "Награды и контейнеры: что выпало и сколько. "
+    "Профиль и статистика: бои, процент побед, средний урон. "
+    "Гараж или рендер танка: название танка, только если оно написано "
+    "на картинке или ты абсолютно уверен, иначе просто опиши танк "
+    "и обстановку. "
+    "Цифры и ники переписывай точно. Ничего не выдумывай."
+)
 
-    params["access_token"] = access_token
-    params["v"] = VK_VERSION
 
+# =========================================================
+# SUPABASE (REST)
+# =========================================================
+
+def sb_headers(extra=None):
+    headers = {
+        "apikey": SUPABASE_SECRET_KEY,
+        "Authorization": f"Bearer {SUPABASE_SECRET_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    if extra:
+        headers.update(extra)
+
+    return headers
+
+
+def sb_insert_row(row):
+    """Вставка строки. Дубли по event_key молча игнорируются."""
     response = requests.post(
-        f"{VK_API}/{method}",
-        data=params,
+        f"{SUPABASE_URL}/rest/v1/{INBOX_TABLE}",
+        params={"on_conflict": "event_key"},
+        headers=sb_headers({
+            "Prefer": "resolution=ignore-duplicates,return=minimal"
+        }),
+        json=row,
         timeout=20,
     )
 
-    response.raise_for_status()
-
-    data = response.json()
-
-    if "error" in data:
-        raise RuntimeError(data["error"])
-
-    return data["response"]
-
-
-def _supabase_rest_url(path):
-    base = SUPABASE_URL.rstrip("/")
-
-    if base.endswith("/rest/v1"):
-        base = base[: -len("/rest/v1")]
-
-    return f"{base}/rest/v1/{path}"
-
-
-def load_token_from_supabase():
-    global VK_USER_TOKEN
-
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        return
-
-    try:
-        response = requests.get(
-            _supabase_rest_url("bot_state"),
-            params={
-                "key": "eq.vk_user_token",
-                "select": "value",
-            },
-            headers={
-                "apikey": SUPABASE_KEY,
-                "Authorization": f"Bearer {SUPABASE_KEY}",
-            },
-            timeout=10,
-        )
-
-        response.raise_for_status()
-
-        rows = response.json()
-
-        if rows:
-            saved_value = (rows[0].get("value") or "").strip()
-
-            if saved_value:
-                VK_USER_TOKEN = saved_value
-
-                print(
-                    "✅ VK_USER_TOKEN загружен из Supabase.",
-                    flush=True,
-                )
-
-    except Exception as e:
-        print(
-            "Supabase load_token error:",
-            e,
-            flush=True,
-        )
-
-
-def save_token_to_supabase(token):
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        return
-
-    try:
-        response = requests.post(
-            _supabase_rest_url("bot_state"),
-            json={
-                "key": "vk_user_token",
-                "value": token,
-            },
-            headers={
-                "apikey": SUPABASE_KEY,
-                "Authorization": f"Bearer {SUPABASE_KEY}",
-                "Content-Type": "application/json",
-                "Prefer": "resolution=merge-duplicates",
-            },
-            timeout=10,
-        )
-
-        response.raise_for_status()
-
-        print(
-            "✅ VK_USER_TOKEN сохранён в Supabase.",
-            flush=True,
-        )
-
-    except Exception as e:
-        print(
-            "Supabase save_token error:",
-            e,
-            flush=True,
-        )
-
-
-def _moscow_day_start_iso():
-    now_msk = datetime.now(MOSCOW_TZ)
-
-    day_start = now_msk.replace(
-        hour=0,
-        minute=0,
-        second=0,
-        microsecond=0,
-    )
-
-    return day_start.isoformat()
-
-
-def count_screenshots_today(author_id):
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        return 0
-
-    try:
-        response = requests.get(
-            _supabase_rest_url("screenshot_log"),
-            params={
-                "select": "id",
-                "author_id": f"eq.{author_id}",
-                "created_at": f"gte.{_moscow_day_start_iso()}",
-            },
-            headers={
-                "apikey": SUPABASE_KEY,
-                "Authorization": f"Bearer {SUPABASE_KEY}",
-            },
-            timeout=10,
-        )
-
-        response.raise_for_status()
-
-        return len(response.json())
-
-    except Exception as e:
-        print(
-            "Supabase count_screenshots_today error:",
-            e,
-            flush=True,
-        )
-
-        return 0
-
-
-def log_screenshot(author_id):
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        return
-
-    try:
-        response = requests.post(
-            _supabase_rest_url("screenshot_log"),
-            json={
-                "author_id": author_id,
-            },
-            headers={
-                "apikey": SUPABASE_KEY,
-                "Authorization": f"Bearer {SUPABASE_KEY}",
-                "Content-Type": "application/json",
-            },
-            timeout=10,
-        )
-
-        response.raise_for_status()
-
-    except Exception as e:
-        print(
-            "Supabase log_screenshot error:",
-            e,
-            flush=True,
-        )
-
-
-def send_message(user_id, text):
-    try:
-        vk_call(
-            "messages.send",
-            user_id=user_id,
-            message=text,
-            random_id=random.randint(
-                1,
-                2 ** 31 - 1,
-            ),
-        )
-
-    except Exception as e:
-        print(
-            "messages.send error:",
-            e,
-            flush=True,
-        )
-
-
-def generate_canned_reply(text):
-    lowered = (text or "").lower()
-
-    ad_words = (
-        "реклам", "прорекл", "пиар",
-        "продвин", "разместить пост",
-    )
-
-    if any(word in lowered for word in ad_words):
-        return (
-            "По вопросам рекламы клана/канала — "
-            f"пиши админу: {ADMIN_LINK}"
-        )
-
-    bot_words = (
-        "ты бот", "ты человек", "живой человек",
-        "с кем я", "кто ты", "человек ли ты",
-    )
-
-    if any(word in lowered for word in bot_words):
-        return (
-            "Я автоматический бот 🤖, здесь нет "
-            "живых модераторов. Присылай скрин из "
-            "World of Tanks Blitz — опубликую его "
-            "в паблике!"
-        )
-
-    greeting_words = (
-        "привет", "здарова", "хай", "ку",
-        "здравствуй", "прив",
-    )
-
-    if any(word in lowered for word in greeting_words):
-        return (
-            "Привет! Я бот 🤖. Пришли скриншот из "
-            "World of Tanks Blitz — опубликую его "
-            "в паблике в порядке очереди."
-        )
-
-    return (
-        "Я бот 🤖 и публикую скрины из World of "
-        "Tanks Blitz, присланные в это сообщение. "
-        "Просто пришли фото! По остальным вопросам "
-        f"— пиши админу: {ADMIN_LINK}"
-    )
-
-
-def get_suggested_posts(count=1, offset=0):
-    if not VK_USER_TOKEN:
+    if response.status_code >= 300:
         raise RuntimeError(
-            "VK_USER_TOKEN отсутствует. "
-            "Открой мини-приложение VK и авторизуйся."
+            f"Supabase {response.status_code}: {response.text[:300]}"
         )
 
-    response = vk_call(
-        "wall.get",
-        token=VK_USER_TOKEN,
-        owner_id=-GROUP_ID,
-        filter="suggests",
-        count=count,
-        offset=offset,
-    )
 
-    return response.get("items", [])
+def sb_insert_with_retry(row, attempts=3):
+    last_error = None
+
+    for attempt in range(attempts):
+        try:
+            sb_insert_row(row)
+            return True
+        except Exception as e:
+            last_error = e
+            time.sleep(2 * (attempt + 1))
+
+    print(f"SUPABASE insert failed: {last_error}", flush=True)
+
+    return False
 
 
-def get_biggest_photo_url(photo):
-    sizes = photo.get("sizes", [])
+# =========================================================
+# VK NAME (необязательно)
+# =========================================================
+
+def get_vk_user_name(user_id):
+    if not VK_TOKEN or not user_id:
+        return None
+
+    cached = user_names.get(str(user_id))
+
+    if cached and time.time() - cached[0] < 24 * 60 * 60:
+        return cached[1]
+
+    try:
+        data = requests.get(
+            f"{VK_API}/users.get",
+            params={
+                "access_token": VK_TOKEN,
+                "v": VK_VERSION,
+                "user_ids": user_id,
+            },
+            timeout=10,
+        ).json()
+
+        users = data.get("response") or []
+
+        if not users:
+            return None
+
+        user = users[0]
+
+        name = (
+            f"{user.get('first_name', '').strip()} "
+            f"{user.get('last_name', '').strip()}"
+        ).strip()
+
+        if name:
+            user_names[str(user_id)] = (time.time(), name)
+
+        return name or None
+
+    except Exception as e:
+        print("VK name error:", e, flush=True)
+        return None
+
+
+# =========================================================
+# LIMITS
+# =========================================================
+
+def media_available():
+    """Есть ли ключ, не на паузе ли он и не выбран ли дневной лимит."""
+    if not groq_client:
+        return False
+
+    now = time.time()
+
+    with media_lock:
+        if now < media_state["blocked_until"]:
+            return False
+
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+        if media_state["day"] != today:
+            media_state["day"] = today
+            media_state["count"] = 0
+
+        if media_state["count"] >= MEDIA_DAILY_LIMIT:
+            return False
+
+        media_state["count"] += 1
+
+    return True
+
+
+def media_note_error(error):
+    """Если лимит Groq кончился, ставим бота на паузу на 30 минут."""
+    low = str(error).lower()
+
+    if any(x in low for x in ("429", "rate", "quota", "limit")):
+        with media_lock:
+            media_state["blocked_until"] = (
+                time.time() + MEDIA_BLOCK_SECONDS
+            )
+
+        print(
+            "MEDIA: лимит Groq, пауза 30 минут",
+            flush=True
+        )
+
+
+# =========================================================
+# ВЛОЖЕНИЯ VK
+# =========================================================
+
+def media_download(url, max_bytes):
+    with requests.get(url, timeout=30, stream=True) as resp:
+        resp.raise_for_status()
+
+        chunks = []
+        size = 0
+
+        for chunk in resp.iter_content(65536):
+            size += len(chunk)
+
+            if size > max_bytes:
+                raise ValueError("файл слишком большой")
+
+            chunks.append(chunk)
+
+    return b"".join(chunks)
+
+
+def vk_pick_photo_url(photo):
+    sizes = [
+        x for x in (photo.get("sizes") or [])
+        if x.get("url")
+    ]
 
     if not sizes:
         return None
 
-    biggest = max(
-        sizes,
-        key=lambda item:
-        item.get("width", 0) *
-        item.get("height", 0)
+    def width(item):
+        return int(item.get("width") or 0)
+
+    fitting = [x for x in sizes if width(x) <= 1280]
+
+    best = (
+        max(fitting, key=width)
+        if fitting
+        else min(sizes, key=width)
     )
 
-    return biggest.get("url")
+    return best["url"]
 
 
-def get_user_mention(user_id):
-    if not user_id or user_id <= 0:
-        return "аноним"
+def vk_find_media(message):
+    """
+    Возвращает (kind, url, duration).
+    kind = 'voice' | 'image' | None.
+    Если вложение есть, а ссылки нет, url = None
+    (строка всё равно будет записана, чтобы не потерять подпись).
+    """
+    for att in (message.get("attachments") or []):
+        kind = att.get("type")
 
-    try:
-        response = vk_call(
-            "users.get",
-            user_ids=user_id,
-        )
+        if kind == "audio_message":
+            data = att.get("audio_message") or {}
 
-        if response:
-            user = response[0]
-
-            name = (
-                f"{user.get('first_name', '')} "
-                f"{user.get('last_name', '')}"
-            ).strip()
-
-            return f"[id{user_id}|{name}]"
-
-    except Exception as e:
-        print(
-            "users.get error:",
-            e,
-            flush=True,
-        )
-
-    return f"[id{user_id}|автор]"
-
-
-def _safe_delete(post_id):
-    try:
-        vk_call(
-            "wall.delete",
-            owner_id=-GROUP_ID,
-            post_id=post_id,
-        )
-
-    except Exception as e:
-        print(
-            "wall.delete error:",
-            e,
-            flush=True,
-        )
-
-
-PROMPT = (
-    "Это скриншот из мобильной игры World of Tanks Blitz, "
-    "присланный подписчиком паблика в предложку. "
-    "Напиши короткий пост для игрового паблика ВКонтакте "
-    "(1–3 предложения), живым разговорным тоном, можно с "
-    "эмодзи, по существу того, что видно на скрине "
-    "(результат боя, урон, техника, достижение и т.п.). "
-    "Обязательно похвали или поздравь игрока с результатом "
-    "в дружеском тоне. "
-    "Не придумывай цифры и детали, которых нет на "
-    "изображении. Если скрин не по теме игры, нерелевантен, "
-    "это спам, мем или что-то не для паблика — "
-    "верни is_relevant=false. "
-    'Ответь СТРОГО в формате JSON без markdown и пояснений: '
-    '{"is_relevant": true, "text": "..."}'
-)
-
-
-def analyze_screenshot(photo_url):
-    fallback = {
-        "is_relevant": True,
-        "text": "Новый скрин от подписчика! 🔥",
-    }
-
-    if not groq_client or not photo_url:
-        return fallback
-
-    try:
-        completion = (
-            groq_client
-            .chat
-            .completions
-            .create(
-                model=GROQ_VISION_MODEL,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": PROMPT,
-                            },
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": photo_url
-                                },
-                            },
-                        ],
-                    }
-                ],
-                max_tokens=220,
-                temperature=0.7,
+            return (
+                "voice",
+                data.get("link_mp3") or data.get("link_ogg"),
+                int(data.get("duration") or 0),
             )
-        )
 
-        raw = (
-            completion
-            .choices[0]
-            .message
-            .content
-            .strip()
-        )
+        if kind == "photo":
+            return (
+                "image",
+                vk_pick_photo_url(att.get("photo") or {}),
+                0,
+            )
 
-        raw = raw.strip("`")
-
-        if raw.lower().startswith("json"):
-            raw = raw[4:].strip()
-
-        parsed = json.loads(raw)
-
-        text = (
-            parsed.get("text") or ""
-        ).strip()
-
-        if not text:
-            return fallback
-
-        return {
-            "is_relevant": bool(
-                parsed.get(
-                    "is_relevant",
-                    True
-                )
-            ),
-            "text": text,
-        }
-
-    except Exception as e:
-        print(
-            "analyze_screenshot error:",
-            e,
-            flush=True,
-        )
-
-        return fallback
+    return None, None, 0
 
 
-COMMENT_SYSTEM_PROMPT = (
-    "Ты — живой участник геймерского паблика ВКонтакте "
-    "про World of Tanks Blitz. Под постами со скринами "
-    "игроков иногда отвечаешь на комментарии людей. "
-    "Пиши коротко (1 предложение, максимум 2), живым "
-    "разговорным тоном, можно с эмодзи, по-дружески. "
-    "Не будь занудным и не пиши как бот/техподдержка. "
-    "Если комментарий — просто эмоция или мем без вопроса, "
-    "можно отреагировать коротко и легко. "
-    "Не отвечай, если комментарий явно не требует ответа "
-    "(в этом случае верни пустую строку)."
-)
+# =========================================================
+# GROQ: ГОЛОС И КАРТИНКИ
+# =========================================================
+
+def media_transcribe(data, filename):
+    result = groq_client.audio.transcriptions.create(
+        file=(filename, data),
+        model=GROQ_WHISPER_MODEL,
+        language="ru",
+        temperature=0,
+    )
+
+    text = getattr(result, "text", None)
+
+    if text is None and isinstance(result, str):
+        text = result
+
+    return (text or "").strip()
 
 
-def _call_groq_text(model, comment_text):
-    completion = (
-        groq_client
-        .chat
-        .completions
-        .create(
-            model=model,
-            messages=[
+def media_describe_image(data):
+    """Описание картинки. Пустая строка = не про Tanks Blitz."""
+    mime = (
+        "image/png"
+        if data[:8] == b"\x89PNG\r\n\x1a\n"
+        else "image/jpeg"
+    )
+
+    b64 = base64.b64encode(data).decode("ascii")
+
+    request_body = dict(
+        model=GROQ_VISION_MODEL,
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": MEDIA_VISION_PROMPT},
                 {
-                    "role": "system",
-                    "content": COMMENT_SYSTEM_PROMPT,
-                },
-                {
-                    "role": "user",
-                    "content": comment_text,
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{mime};base64,{b64}"
+                    },
                 },
             ],
-            max_tokens=120,
-            temperature=0.8,
-        )
+        }],
+        max_tokens=800,
+        temperature=0.3,
     )
 
-    return (
-        completion
-        .choices[0]
-        .message
-        .content
-        .strip()
-    )
-
-
-def generate_comment_reply(comment_text):
-    if not groq_client or not comment_text:
-        return ""
-
     try:
-        return _call_groq_text(
-            GROQ_TEXT_MODEL,
-            comment_text,
+        # Пробуем без «размышлений»: быстрее и дешевле по токенам.
+        completion = groq_client.chat.completions.create(
+            reasoning_effort="none",
+            **request_body
         )
-
     except Exception as e:
-        print(
-            "generate_comment_reply error "
-            f"({GROQ_TEXT_MODEL}):",
-            e,
-            flush=True,
-        )
+        low = str(e).lower()
 
-    try:
-        print(
-            f"Пробуем запасную модель "
-            f"{GROQ_TEXT_MODEL_BACKUP}...",
-            flush=True,
-        )
+        if any(
+            x in low
+            for x in ("reasoning", "400", "invalid", "unsupported")
+        ):
+            completion = groq_client.chat.completions.create(
+                **request_body
+            )
+        else:
+            raise
 
-        return _call_groq_text(
-            GROQ_TEXT_MODEL_BACKUP,
-            comment_text,
-        )
+    raw = completion.choices[0].message.content or ""
 
-    except Exception as e:
-        print(
-            "generate_comment_reply error "
-            f"({GROQ_TEXT_MODEL_BACKUP}):",
-            e,
-            flush=True,
-        )
-
-        return ""
-
-
-def handle_wall_reply_new(event_object):
-    comment_id = event_object.get("id")
-    post_id = event_object.get("post_id")
-    from_id = event_object.get("from_id")
-
-    text = (
-        event_object.get("text") or ""
+    raw = re.sub(
+        r"<think>.*?</think>",
+        "",
+        raw,
+        flags=re.DOTALL
     ).strip()
 
-    if not from_id or from_id < 0:
-        return
+    # Модель ответила «НЕТ» (картинка не про Tanks Blitz).
+    if re.match(r"^\W*нет\b", raw, flags=re.IGNORECASE):
+        return ""
 
-    if not text:
-        return
+    return raw
 
-    reply = generate_comment_reply(
-        text
-    )
 
-    if not reply:
+def media_to_text(kind, url, duration=0):
+    """Голос -> текст, картинка -> описание. При любой ошибке ''."""
+    if not url:
+        return ""
+
+    if kind == "voice" and duration > MEDIA_MAX_VOICE_SECONDS:
         print(
-            f"Комментарий {comment_id}: "
-            "решили не отвечать.",
-            flush=True,
+            f"MEDIA [voice] слишком длинное ({duration} c), пропуск",
+            flush=True
         )
-        return
+        return ""
+
+    if not media_available():
+        print("MEDIA: недоступно (лимит или нет ключа)", flush=True)
+        return ""
 
     try:
-        vk_call(
-            "wall.createComment",
-            owner_id=-GROUP_ID,
-            post_id=post_id,
-            reply_to_comment=comment_id,
-            from_group=1,
-            message=reply,
-        )
+        if kind == "voice":
+            data = media_download(url, MEDIA_MAX_AUDIO_BYTES)
 
-        print(
-            f"Ответили на комментарий "
-            f"{comment_id}: {reply}",
-            flush=True,
-        )
+            name = (
+                "voice.ogg"
+                if ".ogg" in url.split("?")[0]
+                else "voice.mp3"
+            )
+
+            text = media_transcribe(data, name)
+
+        else:
+            data = media_download(url, MEDIA_MAX_IMAGE_BYTES)
+            text = media_describe_image(data)
+
+        text = re.sub(r"\s+", " ", text).strip()
+
+        if not text:
+            print(
+                f"MEDIA [{kind}] пропущено "
+                "(не про Tanks Blitz или пусто)",
+                flush=True
+            )
+        else:
+            print(
+                f"MEDIA [{kind}] OK: {text[:120]}",
+                flush=True
+            )
+
+        return text[:MAX_RESULT_CHARS]
 
     except Exception as e:
-        print(
-            "wall.createComment error:",
-            e,
-            flush=True,
-        )
+        print(f"MEDIA [{kind}] ERROR: {e}", flush=True)
+        media_note_error(e)
+        return ""
 
 
-def handle_message_new(message_object):
-    message = message_object.get("message", {})
+# =========================================================
+# ОБРАБОТКА СОБЫТИЯ
+# =========================================================
 
-    from_id = message.get("from_id")
+def process_event(data):
+    obj = data.get("object") or {}
+    message = obj.get("message") or {}
 
-    text = (message.get("text") or "").strip()
+    peer_id = message.get("peer_id")
+    sender_id = message.get("from_id") or message.get("user_id")
 
-    attachments = message.get(
-        "attachments",
-        [],
+    if not peer_id or not sender_id:
+        return
+
+    # Сообщения от сообществ (других ботов) не трогаем.
+    if int(sender_id) < 0:
+        return
+
+    # Личные сообщения основной бот тоже игнорирует.
+    if int(peer_id) == int(sender_id):
+        return
+
+    kind, url, duration = vk_find_media(message)
+
+    if not kind:
+        return
+
+    caption = (message.get("text") or "").strip()
+
+    reply = message.get("reply_message") or {}
+    reply_from_id = reply.get("from_id")
+
+    result = media_to_text(kind, url, duration)
+
+    event_id = data.get("event_id")
+    cmid = message.get("conversation_message_id")
+
+    event_key = (
+        f"vk:{event_id}"
+        if event_id
+        else f"vk:{peer_id}:{cmid}"
     )
 
-    photo = next(
-        (
-            attachment["photo"]
-            for attachment in attachments
-            if attachment.get("type") == "photo"
+    row = {
+        "event_key": event_key,
+        "chat_id": int(peer_id),
+        "sender_id": int(sender_id),
+        "sender_name": get_vk_user_name(sender_id),
+        "message_id": int(cmid) if cmid is not None else None,
+        "reply_from_id": (
+            int(reply_from_id)
+            if reply_from_id is not None
+            else None
         ),
-        None,
-    )
-
-    if not photo:
-        reply = generate_canned_reply(text)
-
-        if reply and from_id:
-            send_message(from_id, reply)
-
-        return
-
-    if from_id and from_id not in UNLIMITED_USER_IDS:
-        already_sent_today = count_screenshots_today(
-            from_id
-        )
-
-        if already_sent_today >= DAILY_SCREENSHOT_LIMIT:
-            send_message(
-                from_id,
-                "Сегодня ты уже прислал(а) "
-                f"максимум скринов ({DAILY_SCREENSHOT_LIMIT} шт). "
-                "Приходи завтра! 🙂",
-            )
-
-            print(
-                f"Лимит скринов исчерпан для {from_id}.",
-                flush=True,
-            )
-
-            return
-
-    photo_url = get_biggest_photo_url(photo)
-
-    ai_result = analyze_screenshot(
-        photo_url
-    )
-
-    if from_id:
-        log_screenshot(from_id)
-
-    if not ai_result["is_relevant"]:
-        print(
-            "Скрин в ЛС отклонён AI "
-            "как нерелевантный.",
-            flush=True,
-        )
-
-        if from_id:
-            send_message(
-                from_id,
-                "Этот скрин не подходит для паблика "
-                "(не по теме или не разобрать, что на "
-                "нём). Попробуй прислать другой!",
-            )
-
-        return
-
-    mention = get_user_mention(from_id)
-
-    send_message(
-        ADMIN_VK_ID,
-        "📝 Готовый пост:\n\n"
-        f"{ai_result['text']}\n\n"
-        f"Прислал: {mention}\n\n"
-        f"Фото: {photo_url}",
-    )
-
-    if from_id:
-        send_message(
-            from_id,
-            f"{ai_result['text']}\n\n"
-            "Хочешь, чтобы скрин попал в паблик? "
-            "Отправь его через «Предложить новость» "
-            "на стене нашего сообщества — можешь "
-            "вставить туда этот текст 👆",
-        )
-
-
-app = Flask(__name__)
-
-
-@app.route("/")
-def home():
-    oauth_status = (
-        "авторизован"
-        if VK_USER_TOKEN
-        else "НЕ авторизован"
-    )
-
-    return (
-        "VK suggest autoposter работает.<br>"
-        f"VK OAuth: <b>{oauth_status}</b><br><br>"
-        '<a href="/vk/login">'
-        "Авторизоваться через VK (старый способ, "
-        "не работает для мини-приложений)"
-        "</a><br>"
-        '<a href="/vk/miniapp">'
-        "Открыть страницу авторизации мини-приложения"
-        "</a>"
-    )
-
-
-@app.route("/vk/login")
-def vk_login():
-    global oauth_state
-
-    if not VK_CLIENT_ID:
-        return (
-            "Ошибка: VK_CLIENT_ID не задан.",
-            500,
-        )
-
-    if not VK_REDIRECT_URI:
-        return (
-            "Ошибка: VK_REDIRECT_URI не задан.",
-            500,
-        )
-
-    new_state = secrets.token_urlsafe(32)
-
-    with oauth_state_lock:
-        oauth_state = new_state
-
-    params = {
-        "client_id": VK_CLIENT_ID,
-        "redirect_uri": VK_REDIRECT_URI,
-        "response_type": "code",
-        "scope": "wall,photos,offline",
-        "state": new_state,
+        "kind": kind,
+        "caption": caption or None,
+        "result": result,
+        "status": "new",
     }
 
-    auth_url = (
-        "https://oauth.vk.com/authorize?"
-        + urlencode(params)
-    )
-
-    return redirect(auth_url)
-
-
-@app.route("/vk/oauth/callback")
-def vk_oauth_callback():
-    global VK_USER_TOKEN
-    global oauth_state
-
-    error = request.args.get(
-        "error"
-    )
-
-    if error:
-        error_description = request.args.get(
-            "error_description",
-            "",
+    if sb_insert_with_retry(row):
+        print(
+            f"INBOX +1: {kind} от {sender_id} "
+            f"в чате {peer_id} ({len(result)} симв.)",
+            flush=True
         )
 
-        return (
-            "VK OAuth error: "
-            f"{error}<br>"
-            f"{error_description}",
-            400,
-        )
 
-    code = request.args.get("code")
-
-    if not code:
-        return (
-            "VK OAuth: code отсутствует.",
-            400,
-        )
-
-    state = request.args.get(
-        "state"
-    )
-
-    with oauth_state_lock:
-        expected_state = oauth_state
-        oauth_state = None
-
-    if (
-        not state
-        or not expected_state
-        or state != expected_state
-    ):
-        return (
-            "VK OAuth: неверный state.",
-            400,
-        )
-
-    if not VK_CLIENT_ID:
-        return (
-            "VK_CLIENT_ID не задан.",
-            500,
-        )
-
-    if not VK_CLIENT_SECRET:
-        return (
-            "VK_CLIENT_SECRET не задан.",
-            500,
-        )
-
-    if not VK_REDIRECT_URI:
-        return (
-            "VK_REDIRECT_URI не задан.",
-            500,
-        )
-
+def safe_process(data):
     try:
-        response = requests.get(
-            "https://oauth.vk.com/access_token",
-            params={
-                "client_id": VK_CLIENT_ID,
-                "client_secret": VK_CLIENT_SECRET,
-                "redirect_uri": VK_REDIRECT_URI,
-                "code": code,
-            },
-            timeout=20,
-        )
-
-        response.raise_for_status()
-
-        data = response.json()
-
-        if "error" in data:
-            error_json = json.dumps(
-                data,
-                ensure_ascii=False,
-                indent=2,
-            )
-
-            return (
-                "Ошибка получения VK "
-                "access_token:<br>"
-                "<pre>"
-                + error_json
-                + "</pre>",
-                400,
-            )
-
-        access_token = (
-            data.get("access_token") or ""
-        ).strip()
-
-        if not access_token:
-            data_json = json.dumps(
-                data,
-                ensure_ascii=False,
-                indent=2,
-            )
-
-            return (
-                "VK не вернул access_token.<br>"
-                "<pre>"
-                + data_json
-                + "</pre>",
-                400,
-            )
-
-        VK_USER_TOKEN = access_token
-
-        save_token_to_supabase(access_token)
-
-        print(
-            "✅ VK OAuth: пользовательский "
-            "access_token получен.",
-            flush=True,
-        )
-
-        return (
-            "<h2>VK авторизация успешна ✅</h2>"
-            "<p>"
-            "Пользовательский VK API токен получен."
-            "</p>"
-            "<p>"
-            "Теперь бот может использовать "
-            "<b>wall.get filter=suggests</b>."
-            "</p>"
-            "<p>"
-            "Можно закрыть эту страницу."
-            "</p>"
-        )
-
+        process_event(data)
     except Exception as e:
-        print(
-            "VK OAuth callback error:",
-            e,
-            flush=True,
-        )
-
-        return (
-            "Ошибка VK OAuth:<br>"
-            "<pre>"
-            + str(e)
-            + "</pre>",
-            500,
-        )
+        print("process_event error:", e, flush=True)
 
 
-@app.route("/vk/miniapp")
-def vk_miniapp():
-    """
-    Страница авторизации мини-приложения VK.
-    Открывается ВНУТРИ VK (например vk.com/app<ID>).
-    Получает пользовательский токен через VK Bridge
-    (VKWebAppGetAuthToken) и отправляет его на сервер
-    через POST /vk/save-token.
-    """
+def already_seen(event_id):
+    if not event_id:
+        return False
 
-    app_id = VK_CLIENT_ID
+    now = time.time()
 
-    html = f"""<!DOCTYPE html>
-<html lang="ru">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Авторизация БлицСеть</title>
-<script src="https://unpkg.com/@vkontakte/vk-bridge/dist/browser.min.js"></script>
-</head>
-<body style="font-family: sans-serif; padding: 20px;">
-<h3>Авторизация мини-приложения</h3>
-<p id="status">Подключение к VK...</p>
+    with seen_lock:
+        for key in list(seen_events):
+            if now - seen_events[key] > 30 * 60:
+                seen_events.pop(key, None)
 
-<script>
-  var statusEl = document.getElementById('status');
+        if event_id in seen_events:
+            return True
 
-  function setStatus(text) {{
-    statusEl.textContent = text;
-  }}
+        seen_events[event_id] = now
 
-  vkBridge.send('VKWebAppInit')
-    .then(function () {{
-      setStatus('Запрашиваем доступ...');
+        if len(seen_events) > 2000:
+            oldest = min(seen_events, key=seen_events.get)
+            seen_events.pop(oldest, None)
 
-      return vkBridge.send('VKWebAppGetAuthToken', {{
-        app_id: {app_id},
-        scope: 'wall,photos,offline'
-      }});
-    }})
-    .then(function (data) {{
-      if (!data || !data.access_token) {{
-        setStatus('VK не вернул токен.');
-        return;
-      }}
-
-      setStatus('Токен получен, сохраняем на сервере...');
-
-      return fetch('/vk/save-token', {{
-        method: 'POST',
-        headers: {{ 'Content-Type': 'application/json' }},
-        body: JSON.stringify({{ access_token: data.access_token }})
-      }})
-        .then(function (response) {{ return response.json(); }})
-        .then(function (result) {{
-          if (result && result.ok) {{
-            setStatus('Готово! Токен сохранён. Можно закрыть эту страницу.');
-          }} else {{
-            setStatus('Ошибка сохранения токена на сервере.');
-          }}
-        }});
-    }})
-    .catch(function (error) {{
-      setStatus('Ошибка: ' + JSON.stringify(error));
-    }});
-</script>
-</body>
-</html>"""
-
-    return html
+    return False
 
 
-@app.route("/vk/save-token", methods=["POST"])
-def vk_save_token():
-    global VK_USER_TOKEN
+# =========================================================
+# FLASK
+# =========================================================
 
-    data = (
-        request.get_json(
-            force=True,
-            silent=True,
-        )
-        or {}
-    )
-
-    access_token = (
-        data.get("access_token") or ""
-    ).strip()
-
-    if not access_token:
-        return (
-            json.dumps({"ok": False, "error": "no token"}),
-            400,
-            {"Content-Type": "application/json"},
-        )
-
-    VK_USER_TOKEN = access_token
-
-    print(
-        "✅ VK Mini App: пользовательский "
-        "access_token получен и сохранён.",
-        flush=True,
-    )
-
-    save_token_to_supabase(access_token)
-
-    return (
-        json.dumps({"ok": True}),
-        200,
-        {"Content-Type": "application/json"},
-    )
+@app.route("/", methods=["GET"])
+def home():
+    return {
+        "status": "ok",
+        "bot": "VK media bot (eyes and ears)",
+        "version": MEDIA_BOT_VERSION,
+        "groq": bool(groq_client),
+        "supabase": bool(SUPABASE_URL and SUPABASE_SECRET_KEY),
+        "vision_model": GROQ_VISION_MODEL,
+        "whisper_model": GROQ_WHISPER_MODEL,
+    }, 200
 
 
-@app.route(
-    "/vk/callback",
-    methods=["POST"]
-)
-def vk_callback():
-    data = (
-        request.get_json(
-            force=True,
-            silent=True,
-        )
-        or {}
-    )
+@app.route("/callback", methods=["POST"])
+def callback():
+    data = request.get_json(force=True, silent=True) or {}
 
-    if data.get("type") == "confirmation":
+    event_type = data.get("type")
+
+    if event_type == "confirmation":
         return VK_CONFIRMATION_CODE
 
     if (
         VK_GROUP_SECRET
-        and data.get("secret")
-        != VK_GROUP_SECRET
+        and data.get("secret") != VK_GROUP_SECRET
     ):
+        return "invalid secret", 403
+
+    if event_type != "message_new":
         return "ok"
 
-    event_id = data.get(
-        "event_id"
-    )
+    if already_seen(data.get("event_id")):
+        return "ok"
 
-    if event_id:
-        with processed_events_lock:
-            if event_id in processed_events:
-                return "ok"
-
-            processed_events.add(
-                event_id
-            )
-
-            if len(processed_events) > 5000:
-                processed_events.clear()
-
-    event_type = data.get(
-        "type"
-    )
-
-    obj = data.get(
-        "object",
-        {},
-    )
-
-    try:
-        if event_type == "wall_reply_new":
-            handle_wall_reply_new(obj)
-
-        elif event_type == "message_new":
-            handle_message_new(obj)
-
-    except Exception as e:
-        print(
-            "vk_callback handler error:",
-            e,
-            flush=True,
-        )
+    # Сразу отвечаем VK «ok», а тяжёлую работу делаем в фоне:
+    # так VK не будет слать повторы, пока бот просыпается.
+    threading.Thread(
+        target=safe_process,
+        args=(data,),
+        daemon=True
+    ).start()
 
     return "ok"
 
 
+# =========================================================
+# START
+# =========================================================
+
 if __name__ == "__main__":
-    load_token_from_supabase()
-
-    port = int(
-        os.environ.get(
-            "PORT",
-            5000,
-        )
+    print("========================================", flush=True)
+    print(f"👀 VK MEDIA BOT {MEDIA_BOT_VERSION}", flush=True)
+    print(f"🔑 Groq key: {'YES' if groq_client else 'NO'}", flush=True)
+    print(f"🖼 vision: {GROQ_VISION_MODEL}", flush=True)
+    print(f"🎤 whisper: {GROQ_WHISPER_MODEL}", flush=True)
+    print(
+        "🗄 Supabase: "
+        f"{'YES' if SUPABASE_URL and SUPABASE_SECRET_KEY else 'NO'}",
+        flush=True
     )
-
-    app.run(
-        host="0.0.0.0",
-        port=port,
+    print(
+        f"👤 VK_TOKEN (имена): {'YES' if VK_TOKEN else 'NO'}",
+        flush=True
     )
+    print(f"📊 Лимит вложений в день: {MEDIA_DAILY_LIMIT}", flush=True)
+    print("========================================", flush=True)
+
+    port = int(os.environ.get("PORT", 5000))
+
+    app.run(host="0.0.0.0", port=port)
